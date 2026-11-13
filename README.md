@@ -9,7 +9,7 @@ Requirements: Git, Python 3.10 or newer, and OpenCode. Install the latest reposi
 ```bash
 git clone https://github.com/labiozzza/opencode-telegram-skill.git
 cd opencode-telegram-skill
-./install.sh
+sh install.sh
 ```
 
 The installer places the skill in `~/.config/opencode/skills/telegram`, an isolated Telethon environment and account data in `~/.local/share/telegram-skill`, and a `telegram` launcher in `~/.local/bin`. Add `~/.local/bin` to `PATH` if needed. The installer refuses to overwrite an existing non-Git installation; back it up and move it aside first.
