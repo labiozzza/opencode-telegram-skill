@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.env
+credentials.json
+account.session
+*.session
+*.session-journal
+send_log.jsonl
+exports/
