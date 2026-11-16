@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from telethon import TelegramClient, types, utils
 from telethon.tl.functions.channels import DeleteChannelRequest
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.errors import (
     ApiIdInvalidError,
     AuthKeyUnregisteredError,
@@ -470,6 +471,124 @@ def client_from_credentials(credentials: dict[str, Any]) -> TelegramClient:
     return TelegramClient(str(session_base()), credentials["api_id"], credentials["api_hash"])
 
 
+_CODE_DELIVERY_LABELS = {
+    "SentCodeTypeApp": "Telegram app",
+    "SentCodeTypeSms": "SMS",
+    "SentCodeTypeCall": "phone call",
+    "SentCodeTypeFlashCall": "flash call",
+    "SentCodeTypeMissedCall": "missed call",
+    "SentCodeTypeEmailCode": "email",
+    "SentCodeTypeSetUpEmailRequired": "email setup required",
+    "SentCodeTypeFragmentSms": "Fragment SMS",
+    "SentCodeTypeFirebaseSms": "Firebase SMS",
+    "SentCodeTypeSmsPhrase": "SMS phrase",
+    "SentCodeTypeSmsWord": "SMS word",
+}
+
+
+def _code_delivery_label(code_type: Any) -> str:
+    name = type(code_type).__name__
+    return _CODE_DELIVERY_LABELS.get(name, name.removeprefix("SentCodeType") or "unknown")
+
+
+def _print_code_delivery(sent_code: Any) -> None:
+    code_type = getattr(sent_code, "type", None)
+    label = _code_delivery_label(code_type)
+    length = getattr(code_type, "length", None)
+    detail = f" ({length} characters)" if isinstance(length, int) and length > 0 else ""
+    print(f"Telegram code delivery: {label}{detail}.", file=sys.stderr)
+
+    next_type = getattr(sent_code, "next_type", None)
+    if next_type is None:
+        print("Telegram has not offered another delivery method yet.", file=sys.stderr)
+        return
+    next_label = _code_delivery_label(next_type)
+    timeout = getattr(sent_code, "timeout", None)
+    if isinstance(timeout, (int, float)) and timeout > 0:
+        print(
+            f"Resend is available via {next_label} after {int(timeout)} seconds. "
+            "You can request it once from this prompt.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Resend is available via {next_label}. You can request it once from this prompt.", file=sys.stderr)
+
+
+async def _login_with_phone_code(client: Any, phone: str) -> None:
+    sent_code = await client.send_code_request(phone)
+    _print_code_delivery(sent_code)
+
+    code = input("Telegram login code (or type `resend` once): ").strip()
+    if code.casefold() == "resend":
+        next_type = getattr(sent_code, "next_type", None)
+        if next_type is None:
+            print("Telegram has not offered a resend method; enter the code already sent.", file=sys.stderr)
+        else:
+            timeout = getattr(sent_code, "timeout", None)
+            wait_seconds = max(0, int(timeout)) if isinstance(timeout, (int, float)) else 0
+            if wait_seconds:
+                print(f"Waiting {wait_seconds} seconds before the one allowed resend.", file=sys.stderr)
+                await asyncio.sleep(wait_seconds)
+            sent_code = await client(ResendCodeRequest(phone, sent_code.phone_code_hash))
+            _print_code_delivery(sent_code)
+        code = input("Telegram login code: ").strip()
+
+    if not code:
+        raise ValueError("Telegram login code cannot be empty.")
+    try:
+        await client.sign_in(phone=phone, code=code, phone_code_hash=sent_code.phone_code_hash)
+    except SessionPasswordNeededError:
+        password = getpass.getpass("Telegram 2FA password (input hidden): ")
+        await client.sign_in(password=password)
+
+
+def _render_terminal_qr(url: str) -> None:
+    """Render the login URL as a QR matrix locally; never print the URL/token."""
+    import qrcode
+
+    qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(url)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    lines = []
+    for row in range(0, len(matrix), 2):
+        upper = matrix[row]
+        lower = matrix[row + 1] if row + 1 < len(matrix) else [False] * len(upper)
+        lines.append("".join(
+            "█" if top and bottom else "▀" if top else "▄" if bottom else " "
+            for top, bottom in zip(upper, lower)
+        ))
+    print("\n".join(lines), file=sys.stderr)
+
+
+async def _login_with_qr(client: Any, *, max_qr_codes: int = 3) -> None:
+    login = await client.qr_login()
+    for attempt in range(max_qr_codes):
+        _render_terminal_qr(login.url)
+        expires_at = login.expires
+        timeout = max(0.1, (expires_at - datetime.now(UTC)).total_seconds())
+        print(
+            f"Scan this QR in Telegram → Settings → Devices. "
+            f"It expires at {expires_at.astimezone().strftime('%H:%M:%S')} local time.",
+            file=sys.stderr,
+        )
+        try:
+            await login.wait(timeout=timeout)
+            return
+        except asyncio.TimeoutError:
+            print("QR code expired.", file=sys.stderr)
+            if attempt + 1 >= max_qr_codes:
+                raise ValueError("QR code expired; run `telegram auth --qr` again to request a new one.")
+            answer = input("QR code expired. Press Enter to show a new one, or type `q` to cancel: ").strip().casefold()
+            if answer == "q":
+                raise ValueError("QR authorization cancelled after the code expired.")
+            await login.recreate()
+        except SessionPasswordNeededError:
+            password = getpass.getpass("Telegram 2FA password (input hidden): ")
+            await client.sign_in(password=password)
+            return
+
+
 async def close_client(client: Any) -> None:
     try:
         await client.disconnect()
@@ -477,11 +596,33 @@ async def close_client(client: Any) -> None:
         secure_auth_files()
 
 
-async def command_auth(reset_api: bool = False) -> int:
+async def command_auth(reset_api: bool = False, qr: bool = False) -> int:
     if not sys.stdin.isatty():
         return emit({"status": "error", "error": {"code": "interactive_terminal_required", "message": "Run `telegram auth` in a normal interactive Terminal. Never paste the code or 2FA password into OpenCode chat."}}, 2)
     ensure_data_dir()
-    credentials = None if reset_api else load_credentials()
+    credentials = load_credentials()
+    if reset_api and credentials is not None and session_path().exists():
+        # A reset request must never replace credentials backing a live session.
+        existing_client = client_from_credentials(credentials)
+        try:
+            await existing_client.connect()
+            if await existing_client.is_user_authorized():
+                me = await existing_client.get_me()
+                return emit({
+                    "status": "authorized",
+                    "user_id": int(me.id),
+                    "display_name": display_name(me),
+                    "session_path": str(session_path()),
+                    "message": "Existing authorization is active; credentials were not reset.",
+                })
+        except Exception:
+            # If the existing session cannot authorize, continue with the
+            # explicitly requested credential-reset flow below.
+            pass
+        finally:
+            await close_client(existing_client)
+    if reset_api:
+        credentials = None
     if credentials is None:
         try:
             api_id = int(input("Telegram api_id (from https://my.telegram.org): ").strip())
@@ -497,15 +638,13 @@ async def command_auth(reset_api: bool = False) -> int:
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            phone = input("Telegram phone number in international format: ").strip()
-            if not phone:
-                return emit({"status": "error", "error": {"code": "missing_phone", "message": "Phone number is required. Run `telegram auth` again."}}, 2)
-            print("Enter the Telegram login code below. It is read only in this terminal.", file=sys.stderr)
-            await client.start(
-                phone=phone,
-                code_callback=lambda: input("Telegram login code: ").strip(),
-                password=lambda: getpass.getpass("Telegram 2FA password (input hidden): "),
-            )
+            if qr:
+                await _login_with_qr(client)
+            else:
+                phone = input("Telegram phone number in international format: ").strip()
+                if not phone:
+                    return emit({"status": "error", "error": {"code": "missing_phone", "message": "Phone number is required. Run `telegram auth` again."}}, 2)
+                await _login_with_phone_code(client, phone)
         if not await client.is_user_authorized():
             return emit({"status": "error", "error": {"code": "authorization_failed", "message": "Telegram did not authorize this session. Run `telegram auth` again in Terminal."}}, 2)
         me = await client.get_me()
@@ -1000,6 +1139,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     auth = sub.add_parser("auth", help="Authorize interactively in this terminal")
     auth.add_argument("--reset-api", action="store_true", help="Re-enter api_id/api_hash in this terminal")
+    auth.add_argument("--qr", action="store_true", help="Authorize by scanning a QR code shown in this terminal")
     sub.add_parser("status", help="Check saved credentials and session")
     chats = sub.add_parser("chats", help="Search accessible dialog metadata")
     chats.add_argument("--query", required=True)
@@ -1054,7 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def dispatch(args: argparse.Namespace) -> int:
     if args.command == "auth":
-        return await command_auth(reset_api=args.reset_api)
+        return await command_auth(reset_api=args.reset_api, qr=args.qr)
     if args.command == "status":
         return await command_status()
     if args.command == "chats":

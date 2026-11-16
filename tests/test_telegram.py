@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from io import StringIO
@@ -361,6 +361,221 @@ class TelegramSkillTests(unittest.TestCase):
             result = telegram.main(["auth"])
         self.assertEqual(result, 2)
         self.assertEqual(output[0][0]["error"]["code"], "interactive_terminal_required")
+
+    def test_auth_shows_code_delivery_and_allows_only_one_server_timed_resend(self):
+        import asyncio
+
+        first = SimpleNamespace(
+            type=type("SentCodeTypeApp", (), {"length": 5})(),
+            next_type=type("SentCodeTypeSms", (), {"length": 5})(),
+            timeout=17,
+            phone_code_hash="PHONE-CODE-HASH-SECRET",
+        )
+        resent = SimpleNamespace(
+            type=type("SentCodeTypeSms", (), {"length": 5})(),
+            next_type=None,
+            timeout=None,
+            phone_code_hash="RESENT-PHONE-CODE-HASH-SECRET",
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.resend_requests = []
+                self.sign_ins = []
+                self.authorization_checks = iter((False, True))
+
+            async def connect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return next(self.authorization_checks)
+
+            async def send_code_request(self, phone):
+                self.phone = phone
+                return first
+
+            async def __call__(self, request):
+                self.resend_requests.append(request)
+                return resent
+
+            async def sign_in(self, **kwargs):
+                self.sign_ins.append(kwargs)
+
+            async def get_me(self):
+                return SimpleNamespace(id=88, first_name="Test")
+
+        client = FakeClient()
+        stdout, stderr = StringIO(), StringIO()
+        prompts = iter(("+15551234567", "resend", "12345"))
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}), \
+                patch("sys.stdin.isatty", return_value=True), \
+                patch.object(telegram, "load_credentials", return_value={"api_id": 1, "api_hash": "API-HASH-SECRET"}), \
+                patch.object(telegram, "client_from_credentials", return_value=client), \
+                patch.object(telegram, "close_client", new=AsyncMock()), \
+                patch("builtins.input", side_effect=lambda _prompt="": next(prompts)), \
+                patch.object(telegram.asyncio, "sleep", new=AsyncMock()) as sleep, \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            result = asyncio.run(telegram.command_auth())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(client.phone, "+15551234567")
+        self.assertEqual(len(client.resend_requests), 1)
+        self.assertEqual(client.resend_requests[0].phone_code_hash, "PHONE-CODE-HASH-SECRET")
+        self.assertEqual(client.sign_ins, [{
+            "phone": "+15551234567", "code": "12345", "phone_code_hash": "RESENT-PHONE-CODE-HASH-SECRET",
+        }])
+        sleep.assert_awaited_once_with(17)
+        self.assertIn("Telegram app", stderr.getvalue())
+        self.assertIn("SMS", stderr.getvalue())
+        self.assertIn("17 seconds", stderr.getvalue())
+        for secret in ("PHONE-CODE-HASH-SECRET", "RESENT-PHONE-CODE-HASH-SECRET", "API-HASH-SECRET"):
+            self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+
+    def test_auth_qr_expiry_renewal_and_2fa_keep_token_and_password_out_of_output(self):
+        import asyncio
+
+        class FakeQrLogin:
+            def __init__(self):
+                self.url = "tg://login?token=QR-TOKEN-SECRET"
+                self.expires = telegram.datetime.now(telegram.UTC) + telegram.timedelta(seconds=2)
+                self.wait_calls = 0
+                self.recreate_calls = 0
+
+            async def wait(self, timeout):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise asyncio.TimeoutError
+                raise telegram.SessionPasswordNeededError(request=None)
+
+            async def recreate(self):
+                self.recreate_calls += 1
+                self.url = "tg://login?token=QR-TOKEN-RENEWED"
+
+        class FakeClient:
+            def __init__(self):
+                self.qr = FakeQrLogin()
+                self.authorization_checks = iter((False, True))
+                self.passwords = []
+
+            async def connect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return next(self.authorization_checks)
+
+            async def qr_login(self):
+                return self.qr
+
+            async def sign_in(self, *, password):
+                self.passwords.append(password)
+
+            async def get_me(self):
+                return SimpleNamespace(id=89, first_name="QR Test")
+
+        client = FakeClient()
+        stdout, stderr = StringIO(), StringIO()
+        rendered = []
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}), \
+                patch("sys.stdin.isatty", return_value=True), \
+                patch.object(telegram, "load_credentials", return_value={"api_id": 1, "api_hash": "API-HASH-SECRET"}), \
+                patch.object(telegram, "client_from_credentials", return_value=client), \
+                patch.object(telegram, "close_client", new=AsyncMock()), \
+                patch.object(telegram, "_render_terminal_qr", side_effect=rendered.append), \
+                patch("builtins.input", return_value=""), \
+                patch("getpass.getpass", return_value="2FA-PASSWORD-SECRET"), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            result = asyncio.run(telegram.command_auth(qr=True))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(rendered, [
+            "tg://login?token=QR-TOKEN-SECRET",
+            "tg://login?token=QR-TOKEN-RENEWED",
+        ])
+        self.assertEqual(client.qr.recreate_calls, 1)
+        self.assertEqual(client.qr.wait_calls, 2)
+        self.assertEqual(client.passwords, ["2FA-PASSWORD-SECRET"])
+        self.assertIn("QR code expired", stderr.getvalue())
+        for secret in ("QR-TOKEN-SECRET", "API-HASH-SECRET", "2FA-PASSWORD-SECRET"):
+            self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+
+    def test_local_qr_renderer_prints_matrix_not_login_url(self):
+        output = StringIO()
+        with redirect_stderr(output):
+            telegram._render_terminal_qr("tg://login?token=QR-TOKEN-SECRET")
+        self.assertNotIn("QR-TOKEN-SECRET", output.getvalue())
+        self.assertIn("█", output.getvalue())
+
+    def test_code_delivery_labels_cover_telegram_delivery_types(self):
+        for type_name, expected in (
+            ("SentCodeTypeApp", "Telegram app"),
+            ("SentCodeTypeSms", "SMS"),
+            ("SentCodeTypeEmailCode", "email"),
+            ("SentCodeTypeFragmentSms", "Fragment SMS"),
+            ("SentCodeTypeFirebaseSms", "Firebase SMS"),
+            ("SentCodeTypeFlashCall", "flash call"),
+        ):
+            with self.subTest(type_name=type_name):
+                code_type = type(type_name, (), {})()
+                self.assertEqual(telegram._code_delivery_label(code_type), expected)
+
+    def test_auth_does_not_start_login_when_saved_session_is_authorized(self):
+        import asyncio
+
+        class FakeClient:
+            async def connect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return True
+
+            async def send_code_request(self, _phone):
+                raise AssertionError("authorized session must not request a code")
+
+            async def qr_login(self):
+                raise AssertionError("authorized session must not request a QR")
+
+            async def get_me(self):
+                return SimpleNamespace(id=90, first_name="Existing")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}), \
+                patch("sys.stdin.isatty", return_value=True), \
+                patch.object(telegram, "load_credentials", return_value={"api_id": 1, "api_hash": "saved-hash"}), \
+                patch.object(telegram, "client_from_credentials", return_value=FakeClient()), \
+                patch.object(telegram, "close_client", new=AsyncMock()), \
+                patch("builtins.input", side_effect=AssertionError("must not prompt")):
+            self.assertEqual(asyncio.run(telegram.command_auth(qr=True)), 0)
+
+    def test_auth_reset_api_preserves_credentials_for_an_authorized_session(self):
+        import asyncio
+
+        class FakeClient:
+            async def connect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return True
+
+            async def get_me(self):
+                return SimpleNamespace(id=91, first_name="Existing")
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}):
+            telegram.session_path().touch()
+            output = StringIO()
+            with patch("sys.stdin.isatty", return_value=True), \
+                    patch.object(telegram, "load_credentials", return_value={"api_id": 123, "api_hash": "original-hash"}), \
+                    patch.object(telegram, "client_from_credentials", return_value=FakeClient()), \
+                    patch.object(telegram, "close_client", new=AsyncMock()), \
+                    patch.object(telegram, "save_credentials", side_effect=AssertionError("must preserve saved credentials")), \
+                    patch("builtins.input", side_effect=AssertionError("must not prompt")), \
+                    redirect_stdout(output):
+                result = asyncio.run(telegram.command_auth(reset_api=True))
+            self.assertEqual(result, 0)
+            self.assertIn("credentials were not reset", output.getvalue())
+            self.assertTrue(telegram.session_path().exists())
+
+    def test_auth_qr_flag_is_available_in_cli(self):
+        args = telegram.build_parser().parse_args(["auth", "--qr"])
+        self.assertTrue(args.qr)
 
     def test_cli_sync_does_not_require_export_period_arguments(self):
         args = telegram.build_parser().parse_args(["sync", "--chat", "123"])
