@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -53,9 +54,26 @@ class TelegramSkillTests(unittest.TestCase):
             root = telegram.ensure_data_dir()
             telegram.save_credentials(123, "private-api-hash")
             path = telegram.credentials_path()
-            self.assertEqual(stat_mode(root), 0o700)
-            self.assertEqual(stat_mode(path), 0o600)
+            if os.name == "nt":
+                assert_owner_only_acl(self, root, directory=True)
+                assert_owner_only_acl(self, path)
+            else:
+                self.assertEqual(stat_mode(root), 0o700)
+                self.assertEqual(stat_mode(path), 0o600)
             self.assertEqual(json.loads(path.read_text())["api_hash"], "private-api-hash")
+            self.assertEqual(telegram.load_credentials(), {"api_id": 123, "api_hash": "private-api-hash"})
+
+    def test_atomic_credentials_roundtrip_without_fchmod(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}), \
+                patch.dict(telegram.os.__dict__):
+            telegram.os.__dict__.pop("fchmod", None)
+            telegram.ensure_data_dir()
+            telegram.save_credentials(456, "windows-python-312-regression")
+            self.assertEqual(
+                telegram.load_credentials(),
+                {"api_id": 456, "api_hash": "windows-python-312-regression"},
+            )
+            self.assertEqual(list(Path(temp).glob(".credentials.json.*")), [])
 
     def test_session_file_is_restricted_to_owner(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}):
@@ -65,7 +83,10 @@ class TelegramSkillTests(unittest.TestCase):
             session.write_bytes(b"mock sqlite session")
             session.chmod(0o644)
             telegram.secure_auth_files()
-            self.assertEqual(stat_mode(session), 0o600)
+            if os.name == "nt":
+                assert_owner_only_acl(self, session)
+            else:
+                self.assertEqual(stat_mode(session), 0o600)
 
     def test_serializes_message_with_utc_and_attachment_metadata(self):
         message = SimpleNamespace(
@@ -489,6 +510,21 @@ class TelegramSkillTests(unittest.TestCase):
 
 def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
+
+
+def assert_owner_only_acl(test: unittest.TestCase, path: Path, *, directory: bool = False) -> None:
+    result = subprocess.run(
+        ["icacls", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    acl_line = result.stdout.splitlines()[0]
+    test.assertEqual(acl_line.count(":("), 1, acl_line)
+    if directory:
+        test.assertIn(":(OI)(CI)(F)", acl_line)
+    else:
+        test.assertIn(":(F)", acl_line)
 
 
 if __name__ == "__main__":
