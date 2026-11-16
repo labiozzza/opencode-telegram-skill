@@ -349,12 +349,80 @@ class TelegramSkillTests(unittest.TestCase):
         self.assertEqual(invalid_api["code"], "invalid_api_credentials")
         self.assertIn("--reset-api", invalid_api["message"])
         invalid_session = telegram.safe_error(AuthKeyUnregisteredError(request=None))
-        self.assertEqual(invalid_session["code"], "invalid_session")
-        self.assertIn("telegram auth", invalid_session["message"])
+        self.assertEqual(invalid_session["code"], "authorization_revoked")
+        self.assertIn("preserved", invalid_session["message"])
         flood_wait = telegram.safe_error(FloodWaitError(request=None, capture=42))
         self.assertEqual(flood_wait["code"], "flood_wait")
         self.assertEqual(flood_wait["retry_after_seconds"], 42)
 
+    def test_sqlite_and_network_errors_are_classified_without_false_corruption(self):
+        locked = telegram.safe_error(__import__("sqlite3").OperationalError("database is locked"))
+        corrupt = telegram.safe_error(__import__("sqlite3").DatabaseError("file is not a database"))
+        unavailable = telegram.safe_error(__import__("sqlite3").OperationalError("unable to open database file"))
+        network = telegram.safe_error(ConnectionError("connection reset"))
+        self.assertEqual(locked["code"], "session_busy")
+        self.assertEqual(corrupt["code"], "session_database_corrupt")
+        self.assertEqual(unavailable["code"], "session_file_unavailable")
+        self.assertEqual(network["code"], "network_error")
+
+    def test_two_processes_cannot_hold_the_same_session_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lock_path = str(Path(temp) / "account.session.lock")
+            script = (
+                "import sys,time; from filelock import FileLock; "
+                "lock=FileLock(sys.argv[1]); lock.acquire(timeout=2); "
+                "print('acquired',flush=True); time.sleep(1.0); lock.release()"
+            )
+            owner = subprocess.Popen(
+                [sys.executable, "-c", script, lock_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(owner.stdout.readline().strip(), "acquired")
+                competing = __import__("filelock").FileLock(lock_path)
+                with self.assertRaises(__import__("filelock").Timeout):
+                    competing.acquire(timeout=0.15)
+                owner.wait(timeout=5)
+                self.assertEqual(owner.returncode, 0, owner.stderr.read())
+                competing.acquire(timeout=1)
+                competing.release()
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+                if owner.stdout:
+                    owner.stdout.close()
+                if owner.stderr:
+                    owner.stderr.close()
+
+    def test_diagnose_reports_path_sqlite_and_api_authorization_without_secrets(self):
+        import asyncio
+        import sqlite3
+
+        class FakeClient:
+            async def is_user_authorized(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TELEGRAM_SKILL_HOME": temp}):
+            session = telegram.session_path()
+            session.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(session) as db:
+                db.execute("CREATE TABLE session_data (value TEXT)")
+                db.execute("INSERT INTO session_data VALUES ('NEVER-PRINT-SESSION-CONTENT')")
+            db.close()
+            output = StringIO()
+            with patch.object(telegram, "load_credentials", return_value={"api_id": 1, "api_hash": "API-HASH-SECRET"}), \
+                    patch.object(telegram, "client_from_credentials", return_value=FakeClient()), \
+                    patch.object(telegram, "connect_client", new=AsyncMock()), \
+                    patch.object(telegram, "close_client", new=AsyncMock()), \
+                    redirect_stdout(output):
+                self.assertEqual(asyncio.run(telegram.command_diagnose()), 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["session"]["path"], str(session))
+            self.assertEqual(report["session"]["sqlite"], "ok")
+            self.assertEqual(report["authorization"], "authorized")
+            self.assertNotIn("API-HASH-SECRET", output.getvalue())
+            self.assertNotIn("NEVER-PRINT-SESSION-CONTENT", output.getvalue())
     def test_auth_without_tty_returns_guidance_without_network(self):
         output = []
         with patch("sys.stdin.isatty", return_value=False), patch.object(telegram, "emit", side_effect=lambda value, exit_code=0: output.append((value, exit_code)) or exit_code):

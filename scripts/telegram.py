@@ -19,6 +19,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from telethon import TelegramClient, types, utils
 from telethon.tl.functions.channels import DeleteChannelRequest
@@ -443,9 +444,20 @@ def safe_error(exc: BaseException) -> dict[str, Any]:
         retry = datetime.now(UTC) + timedelta(seconds=seconds)
         return {"code": "flood_wait", "message": "Telegram temporarily limited requests; retry later.", "retry_after_seconds": seconds, "retry_at": iso_utc(retry)}
     if isinstance(exc, AUTH_EXCEPTIONS):
-        return {"code": "invalid_session", "message": "Saved Telegram session is invalid or revoked. Run `telegram auth` in Terminal to sign in again."}
+        return {"code": "authorization_revoked", "message": "Telegram rejected the saved authorization as revoked or expired. The session was preserved; run `telegram status` to diagnose, then authorize again only if needed."}
     if isinstance(exc, sqlite3.DatabaseError):
-        return {"code": "invalid_session", "message": "Saved Telegram session file is damaged. Run `telegram auth` in Terminal to sign in again."}
+        message = str(exc).casefold()
+        if "locked" in message or "busy" in message:
+            return {"code": "session_busy", "message": "The Telegram session database is temporarily locked by another process. No session data was changed; retry later."}
+        if any(marker in message for marker in ("malformed", "not a database", "corrupt", "disk image")):
+            return {"code": "session_database_corrupt", "message": "SQLite reports that the Telegram session database is damaged. The file was preserved; run `telegram diagnose` before considering user action."}
+        if any(marker in message for marker in ("unable to open", "readonly", "permission", "i/o error", "disk i/o")):
+            return {"code": "session_file_unavailable", "message": "The Telegram session file is currently unavailable to SQLite. Check file access and disk availability; it was not changed."}
+        return {"code": "session_database_error", "message": "SQLite reported a Telegram session database error; corruption is not confirmed. Run `telegram diagnose`."}
+    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+        return {"code": "network_error", "message": "Telegram could not be reached due to a network timeout or connection failure. The saved session was preserved; retry the read later."}
+    if isinstance(exc, (OSError, FileNotFoundError, PermissionError)):
+        return {"code": "session_file_unavailable", "message": "The Telegram session file or its directory is unavailable. Check access and disk availability; no authorization data was changed."}
     if isinstance(exc, PhoneCodeInvalidError):
         return {"code": "invalid_code", "message": "Telegram login code was invalid. Run `telegram auth` and enter the latest code in Terminal."}
     if isinstance(exc, PhoneCodeExpiredError):
@@ -468,7 +480,24 @@ def emit(payload: dict[str, Any], exit_code: int = 0) -> int:
 
 def client_from_credentials(credentials: dict[str, Any]) -> TelegramClient:
     ensure_data_dir()
-    return TelegramClient(str(session_base()), credentials["api_id"], credentials["api_hash"])
+    client = TelegramClient(str(session_base()), credentials["api_id"], credentials["api_hash"])
+    client._telegram_session_file_lock = FileLock(str(session_path()) + ".lock")
+    return client
+
+
+async def connect_client(client: Any) -> None:
+    lock = getattr(client, "_telegram_session_file_lock", None)
+    if lock is not None:
+        try:
+            await asyncio.to_thread(lock.acquire, timeout=30)
+        except FileLockTimeout as exc:
+            raise sqlite3.OperationalError("database is locked: another Telegram process owns the session") from exc
+    try:
+        await client.connect()
+    except BaseException:
+        if lock is not None and lock.is_locked:
+            lock.release()
+        raise
 
 
 _CODE_DELIVERY_LABELS = {
@@ -593,6 +622,9 @@ async def close_client(client: Any) -> None:
     try:
         await client.disconnect()
     finally:
+        lock = getattr(client, "_telegram_session_file_lock", None)
+        if lock is not None and lock.is_locked:
+            lock.release()
         secure_auth_files()
 
 
@@ -605,7 +637,7 @@ async def command_auth(reset_api: bool = False, qr: bool = False) -> int:
         # A reset request must never replace credentials backing a live session.
         existing_client = client_from_credentials(credentials)
         try:
-            await existing_client.connect()
+            await connect_client(existing_client)
             if await existing_client.is_user_authorized():
                 me = await existing_client.get_me()
                 return emit({
@@ -636,7 +668,7 @@ async def command_auth(reset_api: bool = False, qr: bool = False) -> int:
 
     client = client_from_credentials(credentials)
     try:
-        await client.connect()
+        await connect_client(client)
         if not await client.is_user_authorized():
             if qr:
                 await _login_with_qr(client)
@@ -661,10 +693,10 @@ async def authorized_client() -> tuple[TelegramClient | None, dict[str, Any] | N
         return None, {"code": "needs_auth", "message": "Telegram is not authorized yet. Run `telegram auth` in an interactive Terminal; do not send the code in chat."}
     client = client_from_credentials(credentials)
     try:
-        await client.connect()
+        await connect_client(client)
         if not await client.is_user_authorized():
             await close_client(client)
-            return None, {"code": "invalid_session", "message": "Saved Telegram session is not authorized. Run `telegram auth` in Terminal to sign in again."}
+            return None, {"code": "authorization_missing", "message": "Telegram reports that this session is not currently authorized. The session file was preserved; run `telegram diagnose` before deciding whether interactive authorization is needed."}
         return client, None
     except AUTH_EXCEPTIONS as exc:
         await close_client(client)
@@ -691,6 +723,59 @@ async def command_status() -> int:
     finally:
         if "client" in locals() and client is not None:
             await close_client(client)
+
+
+async def command_diagnose() -> int:
+    """Safely inspect file metadata/SQLite and verify authorization via Telegram."""
+    path = session_path()
+    session: dict[str, Any] = {"path": str(path), "exists": path.is_file()}
+    if path.is_file():
+        try:
+            session["size_bytes"] = path.stat().st_size
+            db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+            try:
+                check = db.execute("PRAGMA quick_check").fetchone()
+                session["sqlite"] = "ok" if check and check[0] == "ok" else "integrity_error"
+            finally:
+                db.close()
+        except sqlite3.OperationalError as exc:
+            session["sqlite"] = "busy" if "locked" in str(exc).casefold() else "unavailable"
+        except sqlite3.DatabaseError:
+            session["sqlite"] = "corrupt"
+        except OSError:
+            session["sqlite"] = "unavailable"
+
+    authorization = "not_checked"
+    credentials = load_credentials()
+    if credentials and session["exists"]:
+        client = client_from_credentials(credentials)
+        try:
+            for attempt, delay in enumerate((0, 0.4, 1.0), 1):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    await connect_client(client)
+                    authorization = "authorized" if await client.is_user_authorized() else "not_authorized"
+                    break
+                except (ConnectionError, TimeoutError, asyncio.TimeoutError):
+                    authorization = "network_unavailable"
+                    if attempt == 3:
+                        break
+                    client = client_from_credentials(credentials)
+                except AUTH_EXCEPTIONS:
+                    authorization = "revoked_or_expired"
+                    break
+                except Exception as exc:
+                    authorization = safe_error(exc)["code"]
+                    break
+                finally:
+                    if getattr(client, "_connected", False):
+                        await close_client(client)
+        finally:
+            lock = getattr(client, "_telegram_session_file_lock", None)
+            if lock is not None and lock.is_locked:
+                await close_client(client)
+    return emit({"status": "diagnosed", "session": session, "authorization": authorization})
 
 
 async def command_chats(query: str) -> int:
@@ -1141,6 +1226,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--reset-api", action="store_true", help="Re-enter api_id/api_hash in this terminal")
     auth.add_argument("--qr", action="store_true", help="Authorize by scanning a QR code shown in this terminal")
     sub.add_parser("status", help="Check saved credentials and session")
+    sub.add_parser("diagnose", help="Safely inspect session file, SQLite integrity, and Telegram authorization")
     chats = sub.add_parser("chats", help="Search accessible dialog metadata")
     chats.add_argument("--query", required=True)
     delete_channel = sub.add_parser(
@@ -1197,6 +1283,8 @@ async def dispatch(args: argparse.Namespace) -> int:
         return await command_auth(reset_api=args.reset_api, qr=args.qr)
     if args.command == "status":
         return await command_status()
+    if args.command == "diagnose":
+        return await command_diagnose()
     if args.command == "chats":
         return await command_chats(args.query)
     if args.command == "delete-channel":

@@ -1,2 +1,3 @@
 Telethon>=1.40,<2
 qrcode>=8,<9
+filelock>=3.16,<4
