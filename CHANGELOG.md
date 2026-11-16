@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Serialize Telethon session lifetimes across processes with a bounded lock.
+- Distinguish SQLite lock, corruption, inaccessible files, network failures, and rejected authorization.
+- Add `telegram diagnose` with read-only SQLite integrity and bounded authorization diagnostics.
+- Preserve the session and prohibit automatic retries for message sends.
+
 ## 0.2.0
 
 - Show Telegram's actual login-code delivery and any server-provided resend method and wait.

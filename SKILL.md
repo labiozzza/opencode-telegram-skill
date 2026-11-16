@@ -32,6 +32,7 @@ telegram auth
 # If api_id/api_hash were rejected:
 telegram auth --reset-api
 telegram status
+telegram diagnose  # run for a precise session/SQLite/authorization diagnosis
 telegram chats --query "Иван"
 telegram info --chat "@username"
 telegram delete-channel --chat "@channel"  # dry run; shows target and confirmation ID
@@ -75,7 +76,7 @@ Direct invocation, independent of PATH:
   "$HOME/.config/opencode/skills/telegram/scripts/telegram.py" <command> ...
 ```
 
-The first-time login is an interactive terminal operation. If status reports `needs_auth` or `invalid_session`, instruct the user to run `telegram auth` in Terminal. For a first-time setup, explain that they must create their own Telegram `api_id` and `api_hash` at <https://my.telegram.org> under **API development tools**; these are client API credentials, not a bot token. Refer them to the detailed “Create Telegram API credentials” steps in the installed skill's `README.md` when useful. The user must enter the API credentials, phone, Telegram login code, and optional 2FA password directly in their local terminal; never request, copy, or handle these secrets in chat or through browser automation. If Telegram rejects saved API credentials, use `telegram auth --reset-api` in Terminal.
+The first-time login is an interactive terminal operation. If status reports an authorization/database issue, run `telegram diagnose` and use its exact category; do not call a busy database or network failure a corrupted/revoked session. Never delete the session or trigger authorization automatically. Ask for terminal reauthorization only when diagnosis confirms Telegram no longer authorizes the saved session. For a first-time setup, explain that they must create their own Telegram `api_id` and `api_hash` at <https://my.telegram.org> under **API development tools**; these are client API credentials, not a bot token. Refer them to the detailed “Create Telegram API credentials” steps in the installed skill's `README.md` when useful. The user must enter the API credentials, phone, Telegram login code, and optional 2FA password directly in their local terminal; never request, copy, or handle these secrets in chat or through browser automation. If Telegram rejects saved API credentials, use `telegram auth --reset-api` in Terminal. Reads/diagnostics may retry transient failures a bounded number of times; never automatically retry a send.
 
 ## Workflow
 

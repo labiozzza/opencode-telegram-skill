@@ -39,7 +39,7 @@ These are **Telegram application API credentials** (`api_id` and `api_hash`), no
 6. In a normal local terminal, run `telegram auth`. When prompted, enter the API ID and API hash directly into the terminal. The hash prompt hides typed input. Then enter your phone number and the Telegram login code in that terminal; the CLI reports Telegram's delivery method and any available resend method/wait. You may request one resend per command. If prompted, enter your 2FA password there too. Alternatively, run `telegram auth --qr` to scan a QR displayed locally in that terminal; expired QR codes can be renewed interactively.
 7. Check the result with `telegram status`. If setup reports rejected API credentials, verify them on `my.telegram.org` and run `telegram auth --reset-api` in the terminal to enter them again.
 
-The CLI stores `credentials.json` and `account.session` under `~/.local/share/telegram-skill/`; setup leaves them absent until the user authorizes. Credentials and the Telethon SQLite session are owner-only (`0600`; data directory `0700`). Login code and optional 2FA password are prompted in the terminal and are not persisted. Treat the session file as sensitive: anyone who obtains it may be able to access your Telegram account. Revoke sessions from Telegram's device/session settings if you suspect exposure.
+The CLI stores `credentials.json` and `account.session` under `~/.local/share/telegram-skill/`; setup leaves them absent until the user authorizes. Credentials and the Telethon SQLite session are owner-only (`0600`; data directory `0700`). Every process takes a bounded cross-process lock for the full Telethon session lifetime, avoiding concurrent SQLite access. Login code and optional 2FA password are prompted in the terminal and are not persisted. QR tokens are rendered locally as terminal pixels; the raw login URL is never printed or sent to an external QR service. Never run authorization through an OpenCode chat; use a normal local terminal. `telegram diagnose` reports the session path, file/SQLite state, and authorization check without exposing credentials or session contents. Session files are never automatically deleted, and sending operations are never automatically retried. Treat the session file as sensitive: anyone who obtains it may be able to access your Telegram account. Revoke sessions from Telegram's device/session settings if you suspect exposure.
 
 ## Commands
 
@@ -47,6 +47,7 @@ The CLI stores `credentials.json` and `account.session` under `~/.local/share/te
 telegram auth
 telegram auth --reset-api  # re-enter API credentials if Telegram rejected them
 telegram auth --qr  # display a local QR code instead of requesting an SMS/app code
+telegram diagnose  # inspect session path/file/SQLite and verify Telegram authorization
 telegram status
 telegram chats --query "Иван"
 telegram info --chat "@username"
