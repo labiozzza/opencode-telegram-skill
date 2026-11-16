@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import getpass
 import json
 import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from datetime import date, datetime, time, timedelta, timezone
@@ -58,19 +60,51 @@ def data_dir() -> Path:
     return Path(os.environ.get("TELEGRAM_SKILL_HOME", "~/.local/share/telegram-skill")).expanduser()
 
 
+def _windows_user_sid() -> str:
+    result = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = list(csv.reader(result.stdout.splitlines()))
+    if not rows or len(rows[0]) < 2 or not rows[0][1].startswith("S-1-"):
+        raise OSError("Could not determine the current Windows user SID")
+    return rows[0][1]
+
+
+def _windows_private_acl(path: Path, *, directory: bool = False) -> None:
+    """Replace inherited ACLs with an owner-only DACL on a secret path."""
+    sid = _windows_user_sid()
+    subprocess.run(
+        ["icacls", str(path), "/reset"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    grant = f"*{sid}:(OI)(CI)F" if directory else f"*{sid}:F"
+    subprocess.run(
+        ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _set_private_permissions(path: Path, mode: int, *, directory: bool = False) -> None:
+    if os.name == "nt":
+        _windows_private_acl(path, directory=directory)
+    else:
+        path.chmod(mode)
+
+
 def ensure_data_dir() -> Path:
     root = data_dir()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        root.chmod(0o700)
-    except OSError:
-        pass
+    _set_private_permissions(root, 0o700, directory=True)
     exports = root / "exports"
     exports.mkdir(mode=0o700, exist_ok=True)
-    try:
-        exports.chmod(0o700)
-    except OSError:
-        pass
+    _set_private_permissions(exports, 0o700, directory=True)
     return root
 
 
@@ -88,18 +122,28 @@ def session_path() -> Path:
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _set_private_permissions(path.parent, 0o700, directory=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1  # fdopen owns the descriptor from this point onward.
+            if os.name == "nt":
+                _set_private_permissions(temp, 0o600)
+            else:
+                fchmod = getattr(os, "fchmod", None)
+                if callable(fchmod):
+                    fchmod(stream.fileno(), 0o600)
             json.dump(payload, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)
-        path.chmod(0o600)
+        if os.name != "nt":
+            path.chmod(0o600)
     finally:
+        if fd >= 0:
+            os.close(fd)
         try:
             temp.unlink()
         except FileNotFoundError:
@@ -125,15 +169,11 @@ def load_credentials() -> dict[str, Any] | None:
 def secure_auth_files() -> None:
     root = data_dir()
     for path in root.glob("account.session*"):
-        try:
-            if path.is_file():
-                path.chmod(0o600)
-        except OSError:
-            pass
-    try:
-        credentials_path().chmod(0o600)
-    except OSError:
-        pass
+        if path.is_file():
+            _set_private_permissions(path, 0o600)
+    path = credentials_path()
+    if path.is_file():
+        _set_private_permissions(path, 0o600)
 
 
 def iso_utc(value: datetime | None) -> str | None:
