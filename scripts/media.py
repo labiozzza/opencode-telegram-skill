@@ -603,11 +603,11 @@ class MediaStore:
         if content_key is not None and previous_key != content_key:
             self._content_sources.setdefault(content_key, []).append(source_id)
 
-    def originals_dir(self, message: Any) -> Path:
+    def originals_dir(self, message: Any, *, topic_id: int | None = None) -> Path:
         date_value = _message_date(message)
         year = f"{date_value.year:04d}" if date_value else "unknown"
         month = f"{date_value.month:02d}" if date_value else "00"
-        topic_id = forum_topic_id(message)
+        topic_id = topic_id if topic_id is not None else forum_topic_id(message)
         if topic_id is None:
             return _ensure_child_dirs(
                 self.root,
@@ -682,6 +682,7 @@ def _source_record(
     descriptor: dict[str, Any],
     *,
     attachment_index: int = 0,
+    topic_id: int | None = None,
 ) -> dict[str, Any]:
     message_id = int(getattr(message, "id"))
     sender = getattr(message, "sender", None)
@@ -706,7 +707,7 @@ def _source_record(
         "size_bytes": None,
         "sha256": None,
         "status": "pending",
-        "forum_topic_id": forum_topic_id(message),
+        "forum_topic_id": topic_id if topic_id is not None else forum_topic_id(message),
         "media_group_id": int(grouped_id) if isinstance(grouped_id, int) else None,
     }
 
@@ -725,6 +726,7 @@ async def skipped_attachment(
     chat_id: int,
     chat_title: str,
     reason: str,
+    topic_id: int | None = None,
 ) -> dict[str, Any]:
     descriptor = attachment_descriptor(message)
     if descriptor is None:
@@ -734,7 +736,7 @@ async def skipped_attachment(
             "status": "attachment_not_found",
             "reason": "This message has no downloadable Telegram photo or document.",
         }
-    record = _source_record(message, chat_id, chat_title, descriptor)
+    record = _source_record(message, chat_id, chat_title, descriptor, topic_id=topic_id)
     existing = await store.existing_download_async(record["source_id"])
     if existing is not None:
         # A run-level filter/cap result must not replace the durable record of a
@@ -754,6 +756,7 @@ async def download_attachment(
     remaining_total_bytes: int,
     allowed_types: set[str] | None,
     safe_error: Callable[[BaseException], dict[str, Any]],
+    topic_id: int | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Download one source attachment; never execute or inspect its contents."""
     descriptor = attachment_descriptor(message)
@@ -765,7 +768,7 @@ async def download_attachment(
             "reason": "This message has no downloadable Telegram photo or document.",
         }, 0)
 
-    record = _source_record(message, chat_id, chat_title, descriptor)
+    record = _source_record(message, chat_id, chat_title, descriptor, topic_id=topic_id)
     if allowed_types and descriptor["attachment_type"] not in allowed_types:
         return (
             await skipped_attachment(
@@ -774,6 +777,7 @@ async def download_attachment(
                 chat_id=chat_id,
                 chat_title=chat_title,
                 reason="type_filter",
+                topic_id=topic_id,
             ),
             0,
         )
@@ -790,7 +794,7 @@ async def download_attachment(
         return (_persist_status(store, record, "skipped", "total_size_limit_exceeded"), 0)
 
     limit = min(max_file_bytes, remaining_total_bytes)
-    directory = store.originals_dir(message)
+    directory = store.originals_dir(message, topic_id=topic_id)
     if isinstance(expected_size, int):
         try:
             if shutil.disk_usage(directory).free < expected_size:

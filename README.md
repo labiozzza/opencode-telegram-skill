@@ -1,6 +1,6 @@
 # OpenCode Telegram skill
 
-Personal-account Telegram CLI powered by Telethon for reading chats, explicitly authorized messaging and bot interaction, and guarded permanent deletion of broadcast channels. It stores API credentials, its SQLite session, logs, and per-chat JSONL exports under `~/.local/share/telegram-skill/`, never in a project or this repository.
+Personal-account Telegram CLI powered by Telethon for reading chats, inventorying folders, exporting forum topics and accessible participants, matching participants to existing private dialogs by `user_id`, explicitly authorized messaging and bot interaction, and guarded permanent deletion of broadcast channels. Account credentials, its SQLite session, logs, and research exports are stored privately outside a project or this repository.
 
 ## Install and update
 
@@ -52,6 +52,10 @@ telegram status
 telegram chats --query "Иван"
 telegram dialogs --format json
 telegram participants --chat "@my_group" --max-participants 10000 --format csv
+telegram folders list
+telegram folders chats --folder "My groups" --format json
+telegram folders chats --folder "My groups" --folder "My channels" --format csv
+telegram topics --chat "-1001234567890"
 telegram info --chat "@username"
 telegram delete-channel --chat "@channel"  # dry run; prints target, link, and confirmation_id
 telegram delete-channel --chat "@channel" --confirm-id -1001234567890  # only after explicit confirmation
@@ -64,9 +68,11 @@ telegram bot-click --chat "@botname" --message-id 12345 --row 0 --column 1 --con
 telegram update-check
 telegram update
 telegram export --chat "@username" [--days 30 | --since YYYY-MM-DD --until YYYY-MM-DD] [--max-messages 5000]
+telegram export --chat "-1001234567890" --topic-id 123 [--max-messages 5000]
+telegram export --chat "501" --all-history [--max-messages 5000]
 telegram sync --chat "@username" [--max-messages 5000]
 telegram media download --chat "@username" --message-id 12345
-telegram media export --chat "@username" --since 2026-10-01 --until 2026-10-31
+telegram media export --chat "-1001234567890" --topic-id 123 --since 2026-10-01 --until 2026-10-31
 ```
 
 Successful commands print one JSON object. `export` defaults to the last 30 days and a 5,000-message cap. The first export reads that range; a subsequent export without an explicit range behaves incrementally. `sync` only fetches IDs above the stored checkpoint. Explicit date-range exports can add older records and deduplicate by message ID.
@@ -89,11 +95,44 @@ Both commands require one `--chat`; an ambiguous title is rejected rather than g
 
 Original bytes are stored outside the repository by default at `~/.local/share/telegram-skill/media/` (expanded under the user's home directory on Windows). `--output-dir` explicitly selects another root. Per-chat folders keep files and a machine-readable `manifest.jsonl` together; forum topics use distinct directories. Each JSONL record has `schema_version: 1` and records the source chat/message/date, topic and media-group IDs, original Telegram filename as metadata, relative/absolute path, byte size, SHA-256, and status. The manifest is append-only; the latest row for a `source_id` is its current state. A run-level filtered or capped skip does not replace a valid completed-download record. Files are staged locally, size-checked, and atomically published without overwriting an existing path. Repeated sources and same-content files with the same extension are deduplicated. If message iteration fails after some downloads, the command returns a partial summary with completed results, received-byte totals, and safe retry guidance.
 
-### Dialog and participant exports
+### Folder inventory, dialogs, and participants
 
 `telegram dialogs` lists accessible dialog metadata. `telegram participants --chat ...` exports API-visible members of one selected group or channel as JSON or CSV. Participant data is saved to a private per-chat JSONL checkpoint and can be resumed; the command replays known IDs and appends only new members. It reports `partial` for limits, API errors, or count mismatches, and `unknown` when Telegram does not expose a total. Telegram may hide members, so an export is not a guarantee of a complete roster.
 
-The v0.4.0 scope does not match members across chats or search account-wide conversation history, and it does not build a review catalog. Those research features are deferred to v0.5.0.
+`telegram folders list` returns Telegram's actual folder definitions, IDs, explicit pinned/include/exclude peers, and available dynamic rules. `telegram folders chats --folder ...` asks Telegram for effective membership using the folder ID, so dynamic criteria (such as group/channel type, contacts, muted, read, and archived state) are evaluated by Telegram. Repeat `--folder` to inventory several folders. Chats are deduplicated by `chat_id` while the `folder_id`, `folder_name`, and `folder_memberships` values preserve every selected membership. Duplicate names require an ID. The result always saves CSV and JSON files and reports incomplete API coverage instead of reconstructing membership from rules.
+
+For multi-chat research, first inventory the requested folders and show the user the factual chat table and saved CSV. Stop and wait for approval before exporting participants, reading any histories, enumerating topics, or downloading media. After approval, process only checked rows; there is no per-chat or per-file reconfirmation. Do not send/publish data, change read state, edit/delete Telegram content, join/leave chats, or expand scope. See `SKILL.md` for the mandatory two-stage workflow.
+
+### Forum topics and history
+
+`telegram topics --chat ...` uses Telegram's paginated `messages.getForumTopics` API and returns actual topic IDs, current titles, closed/hidden/pinned state, and API coverage. Telegram's built-in General topic has ID `1`; if Telegram omits its metadata, it is included with unknown status rather than guessed. Pagination advances with the actual last message ID/date and topic ID; `ForumTopic.top_message` is treated only as the last message ID, never as the topic ID.
+
+`telegram export --chat ... --topic-id <id>` exports that topic's visible history to `exports/chat_<id>/topics/topic_<topic_id>/messages.jsonl`, including the requested topic ID and Telegram's reply/root fields. General is ID `1`; because General messages have no `top_msg_id`, the exporter scans bounded chat-history pages and classifies them using actual reply headers. `metadata.json` saves the cursor and `complete` status; rerunning a partial export continues from the saved cursor and deduplicates message IDs. Closed or renamed topics remain addressable by stable topic ID. Telegram access limits, missing/deleted messages, and request failures are reported instead of being treated as complete.
+
+The separate bounded media command accepts `--topic-id` and uses the existing downloader/manifest. If the message scan reaches its cap, pass the returned cursor back as `--offset-id` to continue the same date range:
+
+```bash
+telegram media export --chat "-1001234567890" --topic-id 123 \
+  --since 2026-10-01 --until 2026-10-31 --max-messages 5000
+telegram media export --chat "-1001234567890" --topic-id 123 \
+  --since 2026-10-01 --until 2026-10-31 --max-messages 5000 --offset-id 45678
+```
+
+### Full history and local participant matching
+
+`telegram export --chat ... --all-history` writes all API-visible history to a separate `all_history.jsonl` checkpoint, bounded by `--max-messages` per run. Continue until `history_sweep_complete` is true; later runs sync new IDs. This is opt-in and does not change the existing 30-day default for ordinary `export`.
+
+Participant and private-dialog exports already contain Telegram `user_id`. To match large exports locally without loading them into LLM context, use:
+
+```bash
+telegram dialogs --format csv
+python scripts/match_participants.py \
+  --dialogs /path/to/dialogs.csv \
+  --participants /path/to/research/participants \
+  --output /path/to/research/matches.csv
+```
+
+The helper streams CSV, JSON-array, or JSONL files into local SQLite, joins strictly on numeric `user_id`, and lists all groups/channels where each matched user appeared. It is a local utility and makes no Telegram API requests. Do not match by display name or username.
 
 ### Analyze downloaded files
 
