@@ -84,20 +84,28 @@ def _records(path: Path) -> Iterator[dict[str, Any]]:
     raise ValueError(f"Unsupported export format: {path.suffix}")
 
 
-def _integer_id(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
+def _exact_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
         return None
-    return parsed if parsed > 0 else None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    digits = text[1:] if text.startswith("-") else text
+    if not digits or not digits.isascii() or not digits.isdecimal():
+        return None
+    return int(text)
+
+
+def _integer_id(value: Any) -> int | None:
+    parsed = _exact_integer(value)
+    return parsed if parsed is not None and parsed > 0 else None
 
 
 def _chat_id(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed != 0 else None
+    parsed = _exact_integer(value)
+    return parsed if parsed is not None and parsed != 0 else None
 
 
 def _participant_files(paths: list[str]) -> list[Path]:

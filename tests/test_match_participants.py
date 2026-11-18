@@ -95,6 +95,39 @@ class MatchParticipantTests(unittest.TestCase):
         self.assertEqual(rows[0]["user_id"], "42")
         self.assertEqual(json.loads(rows[0]["matched_chat_ids"]), [-1007])
 
+    def test_rejects_boolean_and_fractional_ids_instead_of_matching(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dialogs = root / "dialogs.json"
+            dialogs.write_text(
+                json.dumps(
+                    [
+                        {"id": "1", "title": "One", "type": "private", "user_id": 1},
+                        {"id": "501", "title": "Five hundred one", "type": "private", "user_id": 501},
+                        {"id": "503", "title": "Five hundred three", "type": "private", "user_id": 503},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            participants = root / "participants.jsonl"
+            participants.write_text(
+                '{"user_id":true,"chat_id":-1001}\n'
+                '{"user_id":501.9,"chat_id":-1002}\n'
+                '{"user_id":503,"chat_id":-1003.9}\n',
+                encoding="utf-8",
+            )
+            output = root / "matches.csv"
+
+            report = match_participants.match_exports(
+                str(dialogs), [str(participants)], str(output)
+            )
+            with output.open(encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+
+        self.assertEqual(report["matched_users"], 0)
+        self.assertEqual(report["participant_rows_indexed"], 0)
+        self.assertEqual(rows, [])
+
     def test_rejects_malformed_or_unrecognized_exports(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
