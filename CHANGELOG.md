@@ -9,6 +9,7 @@
 - Add `telegram dialogs` and resumable `telegram participants` JSON/CSV exports with owner-role metadata, `user_id` indexing, and explicit API completeness reporting.
 - Keep attachment interpretation outside the CLI: agents may use their available native tools on local downloads; no bundled parser, OCR, or transcription is run.
 - Repair a truncated final participant JSONL record before resuming the standalone participant export.
+- Recover media files published before an interrupted manifest write, and preserve complete final JSONL records without a newline.
 - Replace unsafe Telegram-provided file suffixes, harden existing media paths before reuse, and roll back a published original if staging cleanup fails.
 - Defer account-wide participant matching, conversation search, and review catalogs to the separate v0.5.0 stage.
 

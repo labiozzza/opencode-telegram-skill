@@ -396,6 +396,7 @@ class MediaStore:
                         if stream.read(1) != b"\n":
                             cursor = end
                             boundary = 0
+                            complete_record = False
                             while cursor > 0:
                                 start = max(0, cursor - 64 * 1024)
                                 stream.seek(start)
@@ -405,7 +406,18 @@ class MediaStore:
                                     boundary = start + position + 1
                                     break
                                 cursor = start
-                            stream.truncate(boundary)
+                            stream.seek(boundary)
+                            tail = stream.read()
+                            try:
+                                json.loads(tail.decode("utf-8"))
+                                complete_record = True
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                pass
+                            if complete_record:
+                                stream.seek(0, os.SEEK_END)
+                                stream.write(b"\n")
+                            else:
+                                stream.truncate(boundary)
                             stream.flush()
                             os.fsync(stream.fileno())
             with self.manifest_path.open("rb") as stream:
@@ -531,6 +543,32 @@ class MediaStore:
         self._content_sources[key] = [item for item in sources if item != source_id]
         if not self._content_sources[key]:
             del self._content_sources[key]
+
+    def matching_published_file(
+        self,
+        directory: Path,
+        message_id: int,
+        attachment_index: int,
+        extension: str,
+        digest: str,
+        size: int,
+    ) -> Path | None:
+        """Find an identical file left behind if publication beat manifest append."""
+        stem = str(message_id) if attachment_index == 0 else f"{message_id}-{attachment_index}"
+        for collision in range(10_000):
+            suffix = "" if collision == 0 else f"-{collision}"
+            target = directory / f"{stem}{suffix}{extension}"
+            if _is_link_or_reparse_point(target):
+                raise MediaStorageError("A symlink or reparse point occupies the target filename.")
+            if not target.exists() or not _is_safe_regular_file(target):
+                continue
+            try:
+                if target.stat().st_size == size and _sha256(target) == digest:
+                    _restrict_path(target, directory=False, secure_path=self.secure_path)
+                    return target
+            except OSError as exc:
+                raise MediaStorageError("An existing media file could not be checked safely.") from exc
+        return None
 
     def append(self, record: dict[str, Any]) -> None:
         if self.manifest_path.exists() or self.manifest_path.is_symlink():
@@ -766,6 +804,7 @@ async def download_attachment(
     os.close(fd)
     temp = Path(temp_name)
     final_path: Path | None = None
+    published_new_file = False
     received_bytes = 0
 
     def charge_staged_bytes() -> None:
@@ -842,13 +881,24 @@ async def download_attachment(
             record.pop("reason", None)
             store.append(record)
             return record, received_bytes
-        final_path = store.commit_temp(
-            temp,
+        final_path = await asyncio.to_thread(
+            store.matching_published_file,
             directory,
             int(record["message_id"]),
             int(record["attachment_index"]),
             extension,
+            digest,
+            size,
         )
+        if final_path is None:
+            final_path = store.commit_temp(
+                temp,
+                directory,
+                int(record["message_id"]),
+                int(record["attachment_index"]),
+                extension,
+            )
+            published_new_file = True
         record.update({
             "path": str(final_path.resolve()),
             "relative_path": final_path.resolve().relative_to(store.root).as_posix(),
@@ -862,11 +912,12 @@ async def download_attachment(
         except Exception:
             # Do not leave a newly-published original without its source
             # manifest record when the local metadata write fails.
-            try:
-                final_path.unlink()
-                _fsync_dir(final_path.parent)
-            except OSError:
-                pass
+            if published_new_file:
+                try:
+                    final_path.unlink()
+                    _fsync_dir(final_path.parent)
+                except OSError:
+                    pass
             raise
         return record, received_bytes
     except DownloadLimitExceeded:
@@ -877,7 +928,7 @@ async def download_attachment(
         )
     except Exception as exc:
         charge_staged_bytes()
-        if final_path is not None:
+        if final_path is not None and published_new_file:
             try:
                 final_path.unlink()
                 _fsync_dir(final_path.parent)

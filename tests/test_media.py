@@ -317,6 +317,35 @@ class MediaStorageTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_retry_recovers_an_orphaned_published_file_after_interruption(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "media"
+                message = document_message(103, content_size=len(b"recovered"))
+                store = media.MediaStore(root, 42)
+                orphan = store.originals_dir(message) / "103.pdf"
+                orphan.write_bytes(b"recovered")
+                client = FakeMediaClient(b"recovered")
+
+                record, _ = await media.download_attachment(
+                    client, message, store=store, chat_id=42, chat_title="A",
+                    max_file_bytes=100, remaining_total_bytes=100, allowed_types=None,
+                    safe_error=telegram.safe_error,
+                )
+
+                self.assertEqual(record["status"], "downloaded")
+                self.assertEqual(Path(record["path"]), orphan)
+                self.assertEqual(len(list(root.rglob("*.pdf"))), 1)
+                self.assertEqual(client.calls.count("download_media"), 1)
+                manifest = [
+                    json.loads(line)
+                    for line in store.manifest_path.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual(len(manifest), 1)
+                self.assertEqual(manifest[0]["relative_path"], orphan.relative_to(root).as_posix())
+
+        asyncio.run(run())
+
     def test_content_hash_deduplicates_reposted_attachment(self):
         async def run():
             with tempfile.TemporaryDirectory() as temp:
@@ -519,6 +548,18 @@ class MediaStorageTests(unittest.TestCase):
                 resumed.manifest_path.read_bytes(),
                 b'{"source_id":"42:1:0","status":"skipped"}\n',
             )
+
+    def test_manifest_preserves_a_complete_final_record_without_newline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "media"
+            initial = media.MediaStore(root, 42)
+            complete_record = b'{"source_id":"42:3:0","status":"downloaded"}'
+            initial.manifest_path.write_bytes(complete_record)
+
+            resumed = media.MediaStore(root, 42)
+
+            self.assertEqual(resumed._latest["42:3:0"]["status"], "downloaded")
+            self.assertEqual(resumed.manifest_path.read_bytes(), complete_record + b"\n")
 
     def test_existing_manifest_acl_is_resecured_before_reuse(self):
         with tempfile.TemporaryDirectory() as temp:
