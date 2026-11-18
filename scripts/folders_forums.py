@@ -749,10 +749,11 @@ async def command_export_topic(
                     break
                 scanned += 1
                 message_id = int(getattr(message, "id"))
-                next_cursor = min(next_cursor or message_id, message_id)
                 if not message_belongs_to_topic(message, topic_id):
+                    next_cursor = min(next_cursor or message_id, message_id)
                     continue
                 if message_id in known_ids:
+                    next_cursor = min(next_cursor or message_id, message_id)
                     continue
                 record = tg.serialize_message(message, chat["id"])
                 reply_to = getattr(message, "reply_to", None)
@@ -766,6 +767,7 @@ async def command_export_topic(
                 tg.append_record(messages_path, record)
                 known_ids.add(message_id)
                 written += 1
+                next_cursor = min(next_cursor or message_id, message_id)
         except Exception as exc:
             iteration_error = tg.safe_error(exc)
 

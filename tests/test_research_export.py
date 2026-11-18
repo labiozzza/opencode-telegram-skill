@@ -117,6 +117,93 @@ class ResearchExportTests(unittest.TestCase):
         self.assertTrue(metadata["history_sweep_complete"])
         self.assertTrue(metadata["complete"])
 
+    def test_all_history_export_retries_a_message_that_failed_to_save(self):
+        message_date = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+        def message(message_id):
+            return SimpleNamespace(
+                id=message_id,
+                sender_id=5,
+                sender=None,
+                date=message_date,
+                message=f"message {message_id}",
+                reply_to=None,
+                edit_date=None,
+                media=None,
+            )
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.pages = [[message(5), message(4), message(3)], [message(4), message(3)]]
+
+            def iter_messages(self, entity, **kwargs):
+                self.calls.append(kwargs)
+                page = self.pages[len(self.calls) - 1]
+
+                async def generate():
+                    for item in page:
+                        yield item
+
+                return generate()
+
+        async def run():
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                client = Client()
+                chat_folder = root / "chat_501"
+                failed_once = False
+                append = telegram.append_record
+
+                def append_with_one_failure(path, record):
+                    nonlocal failed_once
+                    if record["message_id"] == 4 and not failed_once:
+                        failed_once = True
+                        raise OSError("simulated write failure")
+                    append(path, record)
+
+                async def authorized(**_kwargs):
+                    return client, None
+
+                async def resolve(_client, _query):
+                    return object(), None
+
+                with patch.object(telegram, "authorized_client", side_effect=authorized), \
+                        patch.object(telegram, "resolve_or_result", side_effect=resolve), \
+                        patch.object(telegram, "entity_record", return_value={
+                            "id": 501, "title": "Private chat", "username": None, "type": "private",
+                        }), \
+                        patch.object(telegram, "chat_dir", return_value=chat_folder), \
+                        patch.object(telegram, "_set_private_permissions", return_value=None), \
+                        patch.object(telegram, "append_record", side_effect=append_with_one_failure), \
+                        patch.object(telegram, "close_client", new=AsyncMock()):
+                    reports = []
+                    metadata_after_failure = None
+                    for index in range(2):
+                        output = []
+                        with patch.object(
+                            telegram,
+                            "emit",
+                            side_effect=lambda payload, exit_code=0: output.append((payload, exit_code)) or exit_code,
+                        ):
+                            code = await telegram.command_all_history_export("501", limit=10)
+                        reports.append((code, output[-1][0]))
+                        if index == 0:
+                            metadata_after_failure = json.loads(
+                                Path(output[-1][0]["metadata_path"]).read_text(encoding="utf-8")
+                            )
+
+                path = Path(reports[-1][1]["messages_path"])
+                ids = [json.loads(line)["message_id"] for line in path.read_text(encoding="utf-8").splitlines()]
+                return client, reports, ids, metadata_after_failure
+
+        client, reports, ids, metadata = asyncio.run(run())
+        self.assertEqual(reports[0][0], 1)
+        self.assertEqual(metadata["history_offset_id"], 5)
+        self.assertEqual(reports[1][0], 0)
+        self.assertEqual(client.calls[1]["offset_id"], 5)
+        self.assertEqual(ids, [5, 4, 3])
+
     def test_media_export_scopes_by_topic_and_reuses_existing_downloader(self):
         thread = SimpleNamespace(reply_to_top_id=90, reply_to_msg_id=80, forum_topic=True)
         wrong_thread = SimpleNamespace(reply_to_top_id=91, reply_to_msg_id=81, forum_topic=True)

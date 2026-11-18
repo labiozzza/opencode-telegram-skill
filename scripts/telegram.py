@@ -1162,13 +1162,15 @@ async def command_all_history_export(query: str, *, limit: int) -> int:
                     break
                 scanned += 1
                 message_id = int(message.id)
-                if mode != "incremental":
-                    next_cursor = min(next_cursor or message_id, message_id)
                 if message_id in known_ids:
+                    if mode != "incremental":
+                        next_cursor = min(next_cursor or message_id, message_id)
                     continue
                 append_record(messages_path, serialize_message(message, chat["id"]))
                 known_ids.add(message_id)
                 written += 1
+                if mode != "incremental":
+                    next_cursor = min(next_cursor or message_id, message_id)
         except Exception as exc:
             iteration_error = safe_error(exc)
 

@@ -447,6 +447,73 @@ class FolderAndForumTests(unittest.TestCase):
         self.assertEqual([row["message_id"] for row in rows], [95, 94, 93])
         self.assertTrue(all(row["topic_id"] == 90 for row in rows))
 
+    def test_topic_export_retries_a_message_that_failed_to_save(self):
+        thread_reply = SimpleNamespace(reply_to_msg_id=40, reply_to_top_id=90, forum_topic=True)
+        messages = {
+            95: SimpleNamespace(id=95, reply_to=thread_reply, action=None, message="five"),
+            94: SimpleNamespace(id=94, reply_to=thread_reply, action=None, message="four"),
+            93: SimpleNamespace(id=93, reply_to=thread_reply, action=None, message="three"),
+        }
+
+        class Client:
+            entity = SimpleNamespace(id=1, title="Forum", forum=True)
+
+            def __init__(self):
+                self.calls = []
+
+            async def get_messages(self, entity, ids):
+                return None
+
+            def iter_messages(self, entity, **kwargs):
+                self.calls.append(kwargs)
+                page = [messages[95], messages[94], messages[93]] if len(self.calls) == 1 else [
+                    messages[94], messages[93]
+                ]
+
+                async def generate():
+                    for message in page:
+                        yield message
+
+                return generate()
+
+        with tempfile.TemporaryDirectory() as temp:
+            client = Client()
+            tg = FakeTelegram(client, Path(temp))
+            append = tg.append_record
+            failed_once = False
+
+            def append_with_one_failure(path, record):
+                nonlocal failed_once
+                if record["message_id"] == 94 and not failed_once:
+                    failed_once = True
+                    raise OSError("simulated write failure")
+                append(path, record)
+
+            tg.append_record = append_with_one_failure
+            first_code = asyncio.run(
+                folders_forums.command_export_topic(
+                    tg, "Forum", topic_id=90, max_messages=10, output_dir=temp
+                )
+            )
+            first_report = tg.output[-1][0]
+            metadata = json.loads(Path(first_report["metadata_path"]).read_text(encoding="utf-8"))
+            second_code = asyncio.run(
+                folders_forums.command_export_topic(
+                    tg, "Forum", topic_id=90, max_messages=10, output_dir=temp
+                )
+            )
+            second_report = tg.output[-1][0]
+            rows = [
+                json.loads(line)
+                for line in Path(second_report["messages_path"]).read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(first_code, 1)
+        self.assertEqual(metadata["history_offset_id"], 95)
+        self.assertEqual(second_code, 0)
+        self.assertEqual(client.calls[1]["offset_id"], 95)
+        self.assertEqual([row["message_id"] for row in rows], [95, 94, 93])
+
     def test_non_forum_chat_is_rejected_before_topic_history_is_read(self):
         class Client:
             entity = SimpleNamespace(id=1, title="Not a forum", forum=False)
