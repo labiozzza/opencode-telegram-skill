@@ -197,6 +197,7 @@ class TelegramSkillTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
                 self.round = 0
+                self.message_date = datetime.now(timezone.utc).replace(microsecond=0)
 
             async def iter_messages(self, entity, **kwargs):
                 self.calls.append(kwargs)
@@ -207,7 +208,7 @@ class TelegramSkillTests(unittest.TestCase):
                         id=message_id,
                         sender_id=5,
                         sender=None,
-                        date=datetime.now(timezone.utc).replace(microsecond=0),
+                        date=self.message_date,
                         message=f"message {message_id}",
                         reply_to=None,
                         edit_date=None,
