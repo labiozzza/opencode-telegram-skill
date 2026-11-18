@@ -24,6 +24,17 @@ jobs:
         with:
           script: |
             const tag = context.ref.replace("refs/tags/", "")
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              })
+              core.notice(`Release ${tag} already exists; nothing to publish.`)
+              return
+            } catch (error) {
+              if (error.status !== 404) throw error
+            }
             await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
