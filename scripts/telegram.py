@@ -39,8 +39,58 @@ from telethon.errors import (
 
 try:
     from .updater import apply_update, check_for_update
+    from . import participants as participants_module
+    from .media import (
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_FILES,
+        DEFAULT_MAX_MESSAGES,
+        DEFAULT_MAX_TOTAL_BYTES,
+        MAX_FILE_BYTES_LIMIT,
+        MAX_FILES_LIMIT,
+        MAX_MESSAGES_LIMIT,
+        MAX_TOTAL_BYTES_LIMIT,
+        MEDIA_TYPES,
+        MediaStorageError,
+        MediaStore,
+        attachment_descriptor,
+        download_attachment,
+        is_network_error,
+        media_error,
+        skipped_attachment,
+    )
+    from .participants import (
+        DEFAULT_MAX_DIALOGS,
+        DEFAULT_MAX_PARTICIPANTS,
+        MAX_DIALOGS_LIMIT,
+        MAX_PARTICIPANTS_LIMIT,
+    )
 except ImportError:  # Running this file directly from the installed scripts directory.
     from updater import apply_update, check_for_update
+    import participants as participants_module
+    from media import (
+        DEFAULT_MAX_FILE_BYTES,
+        DEFAULT_MAX_FILES,
+        DEFAULT_MAX_MESSAGES,
+        DEFAULT_MAX_TOTAL_BYTES,
+        MAX_FILE_BYTES_LIMIT,
+        MAX_FILES_LIMIT,
+        MAX_MESSAGES_LIMIT,
+        MAX_TOTAL_BYTES_LIMIT,
+        MEDIA_TYPES,
+        MediaStorageError,
+        MediaStore,
+        attachment_descriptor,
+        download_attachment,
+        is_network_error,
+        media_error,
+        skipped_attachment,
+    )
+    from participants import (
+        DEFAULT_MAX_DIALOGS,
+        DEFAULT_MAX_PARTICIPANTS,
+        MAX_DIALOGS_LIMIT,
+        MAX_PARTICIPANTS_LIMIT,
+    )
 
 logging.basicConfig(level=logging.ERROR)
 logging.getLogger("telethon").setLevel(logging.ERROR)
@@ -107,6 +157,14 @@ def ensure_data_dir() -> Path:
     exports = root / "exports"
     exports.mkdir(mode=0o700, exist_ok=True)
     _set_private_permissions(exports, 0o700, directory=True)
+    return root
+
+
+def ensure_session_data_dir() -> Path:
+    """Prepare the private account-data root without touching saved exports."""
+    root = data_dir()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _set_private_permissions(root, 0o700, directory=True)
     return root
 
 
@@ -439,6 +497,8 @@ def chat_dir(chat_id: int) -> Path:
 
 
 def safe_error(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, MediaStorageError):
+        return {"code": "media_storage_error", "message": str(exc)}
     if isinstance(exc, FloodWaitError):
         seconds = int(getattr(exc, "seconds", 0))
         retry = datetime.now(UTC) + timedelta(seconds=seconds)
@@ -454,7 +514,7 @@ def safe_error(exc: BaseException) -> dict[str, Any]:
         if any(marker in message for marker in ("unable to open", "readonly", "permission", "i/o error", "disk i/o")):
             return {"code": "session_file_unavailable", "message": "The Telegram session file is currently unavailable to SQLite. Check file access and disk availability; it was not changed."}
         return {"code": "session_database_error", "message": "SQLite reported a Telegram session database error; corruption is not confirmed. Run `telegram diagnose`."}
-    if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+    if is_network_error(exc):
         return {"code": "network_error", "message": "Telegram could not be reached due to a network timeout or connection failure. The saved session was preserved; retry the read later."}
     if isinstance(exc, (OSError, FileNotFoundError, PermissionError)):
         return {"code": "session_file_unavailable", "message": "The Telegram session file or its directory is unavailable. Check access and disk availability; no authorization data was changed."}
@@ -478,8 +538,11 @@ def emit(payload: dict[str, Any], exit_code: int = 0) -> int:
     return exit_code
 
 
-def client_from_credentials(credentials: dict[str, Any]) -> TelegramClient:
-    ensure_data_dir()
+def client_from_credentials(credentials: dict[str, Any], *, preserve_exports: bool = False) -> TelegramClient:
+    if preserve_exports:
+        ensure_session_data_dir()
+    else:
+        ensure_data_dir()
     client = TelegramClient(str(session_base()), credentials["api_id"], credentials["api_hash"])
     client._telegram_session_file_lock = FileLock(str(session_path()) + ".lock")
     return client
@@ -687,11 +750,11 @@ async def command_auth(reset_api: bool = False, qr: bool = False) -> int:
         await close_client(client)
 
 
-async def authorized_client() -> tuple[TelegramClient | None, dict[str, Any] | None]:
+async def authorized_client(*, preserve_exports: bool = False) -> tuple[TelegramClient | None, dict[str, Any] | None]:
     credentials = load_credentials()
     if credentials is None or not session_path().exists():
         return None, {"code": "needs_auth", "message": "Telegram is not authorized yet. Run `telegram auth` in an interactive Terminal; do not send the code in chat."}
-    client = client_from_credentials(credentials)
+    client = client_from_credentials(credentials, preserve_exports=preserve_exports)
     try:
         await connect_client(client)
         if not await client.is_user_authorized():
@@ -1028,6 +1091,262 @@ async def command_export(query: str, *, days: int | None, since_arg: str | None,
         await close_client(client)
 
 
+def _media_store(output_dir: str | None, chat_id: int) -> MediaStore:
+    if output_dir:
+        root = Path(output_dir).expanduser()
+    else:
+        # Do not call ensure_data_dir(): it also updates ACLs on the
+        # pre-existing exports directory, which media commands must leave alone.
+        root = data_dir() / "media"
+    return MediaStore(root, chat_id, secure_path=_set_private_permissions)
+
+
+def _media_safe_error(exc: BaseException) -> dict[str, Any]:
+    return media_error(exc, safe_error)
+
+
+async def command_media_download(
+    query: str,
+    *,
+    message_id: int,
+    output_dir: str | None,
+    allowed_types: set[str] | None,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> int:
+    client, error = await authorized_client(preserve_exports=True)
+    if error:
+        return emit({"status": error["code"], "error": error}, 1)
+    try:
+        entity, result = await resolve_or_result(client, query)
+        if result is not None:
+            return result
+        message = await client.get_messages(entity, ids=message_id)
+        if isinstance(message, (list, tuple)):
+            message = message[0] if message else None
+        if message is None:
+            return emit({
+                "status": "message_not_found",
+                "chat_id": entity_record(entity)["id"],
+                "message_id": message_id,
+                "message": "The message is deleted, unavailable, or not visible in this chat.",
+            }, 1)
+
+        chat = entity_record(entity)
+        store = await asyncio.to_thread(_media_store, output_dir, chat["id"])
+        record, downloaded_bytes = await download_attachment(
+            client,
+            message,
+            store=store,
+            chat_id=chat["id"],
+            chat_title=chat["title"],
+            max_file_bytes=max_file_bytes,
+            remaining_total_bytes=max_total_bytes,
+            allowed_types=allowed_types,
+            safe_error=_media_safe_error,
+        )
+        status = record["status"]
+        return emit({
+            "status": status,
+            "media": record,
+            "manifest_path": str(store.manifest_path),
+            "bytes_downloaded": downloaded_bytes,
+        }, 0 if status in {"downloaded", "already_present"} else 1)
+    except Exception as exc:
+        return emit({"status": "error", "error": _media_safe_error(exc)}, 1)
+    finally:
+        await close_client(client)
+
+
+async def command_media_export(
+    query: str,
+    *,
+    since_arg: str,
+    until_arg: str,
+    output_dir: str | None,
+    max_files: int,
+    max_messages: int,
+    max_file_bytes: int,
+    max_total_bytes: int,
+    allowed_types: set[str] | None,
+) -> int:
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since_arg) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", until_arg):
+            raise ValueError("Media export dates must use YYYY-MM-DD in UTC.")
+        since = parse_date(since_arg)
+        until = parse_date(until_arg, end=True)
+    except ValueError as exc:
+        return emit({"status": "error", "error": safe_error(exc)}, 2)
+    if since > until:
+        return emit({
+            "status": "error",
+            "error": {"code": "invalid_range", "message": "--since must be earlier than or equal to --until."},
+        }, 2)
+
+    client, error = await authorized_client(preserve_exports=True)
+    if error:
+        return emit({"status": error["code"], "error": error}, 1)
+    try:
+        entity, result = await resolve_or_result(client, query)
+        if result is not None:
+            return result
+        chat = entity_record(entity)
+        store = await asyncio.to_thread(_media_store, output_dir, chat["id"])
+        results: list[dict[str, Any]] = []
+        messages_scanned = 0
+        undated_messages_skipped = 0
+        attachments_seen = 0
+        files_considered = 0
+        bytes_downloaded = 0
+        max_files_reached = False
+        max_messages_reached = False
+        interrupted_by_flood_wait = False
+        iteration_error: dict[str, Any] | None = None
+
+        async def messages_with_error_capture():
+            nonlocal iteration_error
+            try:
+                async for item in client.iter_messages(
+                    entity,
+                    # Fetch one sentinel message so an exactly-full but
+                    # exhausted chat/range is not falsely reported as capped.
+                    limit=max_messages + 1,
+                    offset_date=until + timedelta(seconds=1),
+                    wait_time=1,
+                ):
+                    yield item
+            except Exception as exc:
+                iteration_error = _media_safe_error(exc)
+
+        async for message in messages_with_error_capture():
+            if messages_scanned >= max_messages:
+                extra_date = getattr(message, "date", None)
+                if isinstance(extra_date, datetime):
+                    if extra_date.tzinfo is None:
+                        extra_date = extra_date.replace(tzinfo=UTC)
+                    if extra_date.astimezone(UTC) < since:
+                        break
+                max_messages_reached = True
+                break
+            messages_scanned += 1
+            message_date = getattr(message, "date", None)
+            if not isinstance(message_date, datetime):
+                undated_messages_skipped += 1
+                continue
+            if message_date.tzinfo is None:
+                message_date = message_date.replace(tzinfo=UTC)
+            message_date = message_date.astimezone(UTC)
+            if message_date < since:
+                break
+            if message_date > until:
+                continue
+
+            descriptor = attachment_descriptor(message)
+            if descriptor is None:
+                continue
+            attachments_seen += 1
+
+            if allowed_types and descriptor["attachment_type"] not in allowed_types:
+                record = await skipped_attachment(
+                    message,
+                    store=store,
+                    chat_id=chat["id"],
+                    chat_title=chat["title"],
+                    reason="type_filter",
+                )
+                results.append(record)
+                continue
+
+            if files_considered >= max_files:
+                max_files_reached = True
+                results.append(await skipped_attachment(
+                    message,
+                    store=store,
+                    chat_id=chat["id"],
+                    chat_title=chat["title"],
+                    reason="max_files_limit_exceeded",
+                ))
+                continue
+            files_considered += 1
+            record, transferred = await download_attachment(
+                client,
+                message,
+                store=store,
+                chat_id=chat["id"],
+                chat_title=chat["title"],
+                max_file_bytes=max_file_bytes,
+                remaining_total_bytes=max(0, max_total_bytes - bytes_downloaded),
+                allowed_types=allowed_types,
+                safe_error=_media_safe_error,
+            )
+            results.append(record)
+            bytes_downloaded += transferred
+            if (record.get("error") or {}).get("code") == "flood_wait":
+                interrupted_by_flood_wait = True
+                break
+        counts = {
+            "downloaded": sum(item.get("status") == "downloaded" for item in results),
+            "already_present": sum(item.get("status") == "already_present" for item in results),
+            "skipped": sum(
+                item.get("status") == "skipped" and item.get("reason") != "type_filter"
+                for item in results
+            ),
+            "filtered": sum(item.get("reason") == "type_filter" for item in results),
+            "errors": sum(item.get("status") in {"error", "unavailable"} for item in results),
+        }
+        partial = bool(
+            counts["skipped"]
+            or counts["errors"]
+            or max_files_reached
+            or max_messages_reached
+            or interrupted_by_flood_wait
+            or undated_messages_skipped
+            or iteration_error is not None
+        )
+        payload = {
+            "status": "partial" if partial else "complete",
+            "chat_id": chat["id"],
+            "chat_title": chat["title"],
+            "period_start": iso_utc(since),
+            "period_end": iso_utc(until),
+            "messages_scanned": messages_scanned,
+            "undated_messages_skipped": undated_messages_skipped,
+            "attachments_seen": attachments_seen,
+            "files_considered": files_considered,
+            "bytes_downloaded": bytes_downloaded,
+            "counts": counts,
+            "max_files_reached": max_files_reached,
+            "max_messages_reached": max_messages_reached,
+            "limits": [
+                {
+                    "limit": "max_files",
+                    "status": "skipped",
+                    "reason": f"More than {max_files} eligible attachments fell within the selected range.",
+                } if max_files_reached else None,
+                {
+                    "limit": "max_messages",
+                    "status": "skipped",
+                    "reason": f"The scan reached the {max_messages}-message cap.",
+                } if max_messages_reached else None,
+                {
+                    "limit": "date_range",
+                    "status": "skipped",
+                    "reason": f"{undated_messages_skipped} messages without timestamps were excluded from the bounded export.",
+                } if undated_messages_skipped else None,
+            ],
+            "manifest_path": str(store.manifest_path),
+            "results": results,
+        }
+        if iteration_error is not None:
+            payload["error"] = iteration_error
+        payload["limits"] = [item for item in payload["limits"] if item is not None]
+        return emit(payload, 1 if partial else 0)
+    except Exception as exc:
+        return emit({"status": "error", "error": _media_safe_error(exc)}, 1)
+    finally:
+        await close_client(client)
+
+
 def send_log_path() -> Path:
     return data_dir() / "send_log.jsonl"
 
@@ -1229,6 +1548,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("diagnose", help="Safely inspect session file, SQLite integrity, and Telegram authorization")
     chats = sub.add_parser("chats", help="Search accessible dialog metadata")
     chats.add_argument("--query", required=True)
+    dialogs = sub.add_parser("dialogs", help="List accessible groups, channels, and private dialogs")
+    dialogs.add_argument("--format", choices=("json", "csv"), default="json")
+    dialogs.add_argument("--output-dir", help="Private export root (default: Telegram skill data directory)")
+    dialogs.add_argument("--max-dialogs", type=int, default=DEFAULT_MAX_DIALOGS)
+    participants = sub.add_parser("participants", help="Export accessible participants from one group or channel")
+    participants.add_argument("--chat", required=True, help="Accessible group/channel ID, username, or exact title")
+    participants.add_argument(
+        "--max-participants",
+        type=int,
+        default=DEFAULT_MAX_PARTICIPANTS,
+        help="Maximum new participants per run",
+    )
+    participants.add_argument("--format", choices=("json", "csv"), default="json")
+    participants.add_argument("--output-dir", help="Private export root (default: Telegram skill data directory)")
     delete_channel = sub.add_parser(
         "delete-channel",
         help="Permanently delete a broadcast channel (dry run unless --confirm-id is supplied)",
@@ -1248,6 +1581,25 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--until", help="Inclusive end date YYYY-MM-DD (UTC)")
         if name in {"export", "sync"}:
             command.add_argument("--max-messages", type=int, default=DEFAULT_LIMIT)
+    media = sub.add_parser("media", help="Download media from one explicitly selected chat")
+    media_sub = media.add_subparsers(dest="media_command", required=True)
+    media_download = media_sub.add_parser("download", help="Download one attachment by message ID")
+    media_download.add_argument("--chat", required=True, help="Chat ID, @username, or exact dialog title")
+    media_download.add_argument("--message-id", required=True, type=int)
+    media_download.add_argument("--output-dir", help="Destination root (default: private Telegram skill data directory)")
+    media_download.add_argument("--type", action="append", choices=MEDIA_TYPES, help="Limit to a media type; repeat to allow several")
+    media_download.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
+    media_download.add_argument("--max-total-bytes", type=int, default=DEFAULT_MAX_TOTAL_BYTES)
+    media_export = media_sub.add_parser("export", help="Download bounded media from one chat and UTC date range")
+    media_export.add_argument("--chat", required=True, help="Chat ID, @username, or exact dialog title")
+    media_export.add_argument("--since", required=True, help="Inclusive start date YYYY-MM-DD (UTC)")
+    media_export.add_argument("--until", required=True, help="Inclusive end date YYYY-MM-DD (UTC)")
+    media_export.add_argument("--output-dir", help="Destination root (default: private Telegram skill data directory)")
+    media_export.add_argument("--type", action="append", choices=MEDIA_TYPES, help="Limit to a media type; repeat to allow several")
+    media_export.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
+    media_export.add_argument("--max-messages", type=int, default=DEFAULT_MAX_MESSAGES)
+    media_export.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
+    media_export.add_argument("--max-total-bytes", type=int, default=DEFAULT_MAX_TOTAL_BYTES)
     send = sub.add_parser("send", help="Send one message (dry run unless --confirm)")
     send.add_argument("--chat", required=True, help="Chat ID, @username or exact dialog title")
     send.add_argument("--text", required=True, help="Exact message text")
@@ -1287,10 +1639,65 @@ async def dispatch(args: argparse.Namespace) -> int:
         return await command_diagnose()
     if args.command == "chats":
         return await command_chats(args.query)
+    if args.command == "dialogs":
+        if not 1 <= args.max_dialogs <= MAX_DIALOGS_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-dialogs must be between 1 and {MAX_DIALOGS_LIMIT}."}}, 2)
+        return await participants_module.command_dialogs(
+            sys.modules[__name__],
+            output_format=args.format,
+            output_dir=args.output_dir,
+            max_dialogs=args.max_dialogs,
+        )
+    if args.command == "participants":
+        if not 1 <= args.max_participants <= MAX_PARTICIPANTS_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-participants must be between 1 and {MAX_PARTICIPANTS_LIMIT}."}}, 2)
+        return await participants_module.command_participants(
+            sys.modules[__name__],
+            args.chat,
+            max_participants=args.max_participants,
+            output_format=args.format,
+            output_dir=args.output_dir,
+        )
     if args.command == "delete-channel":
         return await command_delete_channel(args.chat, confirm_id=args.confirm_id)
     if args.command == "info":
         return await command_info(args.chat)
+    if args.command == "media":
+        allowed_types = set(args.type) if args.type else None
+        if args.media_command == "download":
+            if args.message_id < 1:
+                return emit({"status": "error", "error": {"code": "invalid_message_id", "message": "--message-id must be a positive integer."}}, 2)
+            if not 1 <= args.max_file_bytes <= MAX_FILE_BYTES_LIMIT:
+                return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-file-bytes must be between 1 and {MAX_FILE_BYTES_LIMIT}."}}, 2)
+            if not 1 <= args.max_total_bytes <= MAX_TOTAL_BYTES_LIMIT:
+                return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-total-bytes must be between 1 and {MAX_TOTAL_BYTES_LIMIT}."}}, 2)
+            return await command_media_download(
+                args.chat,
+                message_id=args.message_id,
+                output_dir=args.output_dir,
+                allowed_types=allowed_types,
+                max_file_bytes=args.max_file_bytes,
+                max_total_bytes=args.max_total_bytes,
+            )
+        if not 1 <= args.max_files <= MAX_FILES_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-files must be between 1 and {MAX_FILES_LIMIT}."}}, 2)
+        if not 1 <= args.max_messages <= MAX_MESSAGES_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-messages must be between 1 and {MAX_MESSAGES_LIMIT}."}}, 2)
+        if not 1 <= args.max_file_bytes <= MAX_FILE_BYTES_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-file-bytes must be between 1 and {MAX_FILE_BYTES_LIMIT}."}}, 2)
+        if not 1 <= args.max_total_bytes <= MAX_TOTAL_BYTES_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-total-bytes must be between 1 and {MAX_TOTAL_BYTES_LIMIT}."}}, 2)
+        return await command_media_export(
+            args.chat,
+            since_arg=args.since,
+            until_arg=args.until,
+            output_dir=args.output_dir,
+            max_files=args.max_files,
+            max_messages=args.max_messages,
+            max_file_bytes=args.max_file_bytes,
+            max_total_bytes=args.max_total_bytes,
+            allowed_types=allowed_types,
+        )
     if args.command == "send":
         return await send_batch([{"chat": args.chat, "text": args.text}], confirm=args.confirm)
     if args.command == "send-batch":
