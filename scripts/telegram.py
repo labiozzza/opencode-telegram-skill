@@ -40,6 +40,7 @@ from telethon.errors import (
 try:
     from .updater import apply_update, check_for_update
     from . import participants as participants_module
+    from . import folders_forums as folders_forums_module
     from .media import (
         DEFAULT_MAX_FILE_BYTES,
         DEFAULT_MAX_FILES,
@@ -67,6 +68,7 @@ try:
 except ImportError:  # Running this file directly from the installed scripts directory.
     from updater import apply_update, check_for_update
     import participants as participants_module
+    import folders_forums as folders_forums_module
     from media import (
         DEFAULT_MAX_FILE_BYTES,
         DEFAULT_MAX_FILES,
@@ -1091,6 +1093,136 @@ async def command_export(query: str, *, days: int | None, since_arg: str | None,
         await close_client(client)
 
 
+async def command_all_history_export(query: str, *, limit: int) -> int:
+    """Export all API-visible history in bounded, resumable pages."""
+    client, error = await authorized_client()
+    if error:
+        return emit({"status": error["code"], "error": error}, 1)
+    try:
+        entity, result = await resolve_or_result(client, query)
+        if result is not None:
+            return result
+        chat = entity_record(entity)
+        folder = chat_dir(chat["id"])
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _set_private_permissions(folder, 0o700, directory=True)
+        messages_path = folder / "all_history.jsonl"
+        metadata_path = folder / "all_history.metadata.json"
+        existing_count, _ = repair_jsonl(messages_path)
+        known_ids = existing_ids(messages_path)
+        previous = read_metadata(metadata_path) or {}
+        sweep_complete = previous.get("history_sweep_complete") is True
+        mode = "incremental" if sweep_complete else (
+            "resume" if previous.get("history_in_progress") is True or known_ids else "initial"
+        )
+
+        if mode == "incremental":
+            checkpoint = max(known_ids, default=0)
+            kwargs: dict[str, Any] = {"limit": limit + 1}
+            if checkpoint:
+                kwargs.update({"min_id": checkpoint, "reverse": True})
+        else:
+            saved_cursor = previous.get("history_offset_id") if previous.get("history_in_progress") else None
+            try:
+                cursor = int(saved_cursor or 0)
+            except (TypeError, ValueError):
+                cursor = 0
+            if mode == "resume" and not cursor:
+                cursor = min(known_ids, default=0)
+            kwargs = {"limit": limit + 1}
+            if cursor:
+                kwargs["offset_id"] = cursor
+
+        started_at = iso_utc(datetime.now(UTC))
+        atomic_json(
+            metadata_path,
+            {
+                **previous,
+                "schema_version": 1,
+                "chat": chat,
+                "scope": "all Telegram-visible messages returned by iter_messages",
+                "history_in_progress": mode != "incremental",
+                "history_offset_id": kwargs.get("offset_id", 0),
+                "history_sweep_complete": sweep_complete,
+                "complete": False,
+                "mode": mode,
+                "started_or_resumed_at": started_at,
+            },
+        )
+
+        scanned = 0
+        written = 0
+        next_cursor = int(kwargs.get("offset_id", 0) or 0)
+        capped = False
+        iteration_error: dict[str, Any] | None = None
+        try:
+            async for message in client.iter_messages(entity, **kwargs):
+                if scanned >= limit:
+                    capped = True
+                    break
+                scanned += 1
+                message_id = int(message.id)
+                if message_id in known_ids:
+                    if mode != "incremental":
+                        next_cursor = min(next_cursor or message_id, message_id)
+                    continue
+                append_record(messages_path, serialize_message(message, chat["id"]))
+                known_ids.add(message_id)
+                written += 1
+                if mode != "incremental":
+                    next_cursor = min(next_cursor or message_id, message_id)
+        except Exception as exc:
+            iteration_error = safe_error(exc)
+
+        page_complete = not capped and iteration_error is None
+        if mode == "incremental":
+            new_sweep_complete = sweep_complete
+        else:
+            new_sweep_complete = page_complete
+        complete = page_complete and new_sweep_complete
+        finished_at = iso_utc(datetime.now(UTC))
+        metadata = {
+            "schema_version": 1,
+            "chat": chat,
+            "scope": "all Telegram-visible messages returned by iter_messages",
+            "mode": mode,
+            "history_in_progress": mode != "incremental" and not page_complete,
+            "history_offset_id": next_cursor if mode != "incremental" and not page_complete else None,
+            "history_sweep_complete": new_sweep_complete,
+            "messages_scanned_this_run": scanned,
+            "messages_processed_this_run": written,
+            "message_count": existing_count + written,
+            "complete": complete,
+            "limit": limit,
+            "limit_reached": capped,
+            "error": iteration_error,
+            "coverage_note": "Complete means Telegram's accessible iterator was exhausted; it does not imply deleted, hidden, or inaccessible messages were recovered.",
+            "updated_at": finished_at,
+        }
+        atomic_json(metadata_path, metadata)
+        return emit(
+            {
+                "status": "complete" if complete else "partial",
+                "mode": mode,
+                "chat_id": chat["id"],
+                "messages_scanned": scanned,
+                "messages_processed": written,
+                "message_count": existing_count + written,
+                "history_sweep_complete": new_sweep_complete,
+                "complete": complete,
+                "limit_reached": capped,
+                "error": iteration_error,
+                "messages_path": str(messages_path),
+                "metadata_path": str(metadata_path),
+            },
+            0 if complete else 1,
+        )
+    except Exception as exc:
+        return emit({"status": "error", "error": safe_error(exc)}, 1)
+    finally:
+        await close_client(client)
+
+
 def _media_store(output_dir: str | None, chat_id: int) -> MediaStore:
     if output_dir:
         root = Path(output_dir).expanduser()
@@ -1169,6 +1301,8 @@ async def command_media_export(
     max_file_bytes: int,
     max_total_bytes: int,
     allowed_types: set[str] | None,
+    topic_id: int | None = None,
+    offset_id: int | None = None,
 ) -> int:
     try:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since_arg) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", until_arg):
@@ -1182,6 +1316,10 @@ async def command_media_export(
             "status": "error",
             "error": {"code": "invalid_range", "message": "--since must be earlier than or equal to --until."},
         }, 2)
+    if topic_id is not None and topic_id < 1:
+        return emit({"status": "error", "error": {"code": "invalid_topic_id", "message": "--topic-id must be a positive integer."}}, 2)
+    if offset_id is not None and offset_id < 1:
+        return emit({"status": "error", "error": {"code": "invalid_offset_id", "message": "--offset-id must be a positive integer."}}, 2)
 
     client, error = await authorized_client(preserve_exports=True)
     if error:
@@ -1191,6 +1329,11 @@ async def command_media_export(
         if result is not None:
             return result
         chat = entity_record(entity)
+        if topic_id is not None and getattr(entity, "forum", None) is not True:
+            return emit(
+                {"status": "not_a_forum", "chat": chat, "topic_id": topic_id, "message": "Telegram did not report this chat as a forum."},
+                2,
+            )
         store = await asyncio.to_thread(_media_store, output_dir, chat["id"])
         results: list[dict[str, Any]] = []
         messages_scanned = 0
@@ -1200,20 +1343,25 @@ async def command_media_export(
         bytes_downloaded = 0
         max_files_reached = False
         max_messages_reached = False
+        next_offset_id: int | None = None
         interrupted_by_flood_wait = False
         iteration_error: dict[str, Any] | None = None
 
         async def messages_with_error_capture():
             nonlocal iteration_error
             try:
-                async for item in client.iter_messages(
-                    entity,
+                kwargs: dict[str, Any] = {
                     # Fetch one sentinel message so an exactly-full but
                     # exhausted chat/range is not falsely reported as capped.
-                    limit=max_messages + 1,
-                    offset_date=until + timedelta(seconds=1),
-                    wait_time=1,
-                ):
+                    "limit": max_messages + 1,
+                    "offset_date": until + timedelta(seconds=1),
+                    "wait_time": 1,
+                }
+                if offset_id is not None:
+                    kwargs["offset_id"] = offset_id
+                if topic_id is not None and topic_id != 1:
+                    kwargs["reply_to"] = topic_id
+                async for item in client.iter_messages(entity, **kwargs):
                     yield item
             except Exception as exc:
                 iteration_error = _media_safe_error(exc)
@@ -1229,6 +1377,11 @@ async def command_media_export(
                 max_messages_reached = True
                 break
             messages_scanned += 1
+            message_id = getattr(message, "id", None)
+            if isinstance(message_id, int):
+                next_offset_id = message_id
+            if topic_id is not None and not folders_forums_module.message_belongs_to_topic(message, topic_id):
+                continue
             message_date = getattr(message, "date", None)
             if not isinstance(message_date, datetime):
                 undated_messages_skipped += 1
@@ -1253,6 +1406,7 @@ async def command_media_export(
                     chat_id=chat["id"],
                     chat_title=chat["title"],
                     reason="type_filter",
+                    topic_id=topic_id,
                 )
                 results.append(record)
                 continue
@@ -1265,6 +1419,7 @@ async def command_media_export(
                     chat_id=chat["id"],
                     chat_title=chat["title"],
                     reason="max_files_limit_exceeded",
+                    topic_id=topic_id,
                 ))
                 continue
             files_considered += 1
@@ -1278,6 +1433,7 @@ async def command_media_export(
                 remaining_total_bytes=max(0, max_total_bytes - bytes_downloaded),
                 allowed_types=allowed_types,
                 safe_error=_media_safe_error,
+                topic_id=topic_id,
             )
             results.append(record)
             bytes_downloaded += transferred
@@ -1307,6 +1463,7 @@ async def command_media_export(
             "status": "partial" if partial else "complete",
             "chat_id": chat["id"],
             "chat_title": chat["title"],
+            "topic_id": topic_id,
             "period_start": iso_utc(since),
             "period_end": iso_utc(until),
             "messages_scanned": messages_scanned,
@@ -1317,6 +1474,7 @@ async def command_media_export(
             "counts": counts,
             "max_files_reached": max_files_reached,
             "max_messages_reached": max_messages_reached,
+            "next_offset_id": next_offset_id if max_messages_reached else None,
             "limits": [
                 {
                     "limit": "max_files",
@@ -1552,6 +1710,21 @@ def build_parser() -> argparse.ArgumentParser:
     dialogs.add_argument("--format", choices=("json", "csv"), default="json")
     dialogs.add_argument("--output-dir", help="Private export root (default: Telegram skill data directory)")
     dialogs.add_argument("--max-dialogs", type=int, default=DEFAULT_MAX_DIALOGS)
+    folders = sub.add_parser("folders", help="Inspect Telegram folder definitions and effective membership")
+    folder_sub = folders.add_subparsers(dest="folders_command", required=True)
+    folder_list = folder_sub.add_parser("list", help="List Telegram folder IDs, rules, includes, excludes, and pins")
+    folder_list.add_argument("--format", choices=("json", "csv"), default="json")
+    folder_list.add_argument("--output-dir", help="Private export root (default: Telegram skill data directory)")
+    folder_chats = folder_sub.add_parser("chats", help="List effective chats from one or more Telegram folders")
+    folder_chats.add_argument("--folder", action="append", required=True, help="Exact folder name or ID; repeat to select more")
+    folder_chats.add_argument("--format", choices=("json", "csv"), default="json")
+    folder_chats.add_argument("--output-dir", help="Private export root (default: Telegram skill data directory)")
+    folder_chats.add_argument("--max-chats", type=int, default=DEFAULT_MAX_DIALOGS)
+    topics = sub.add_parser("topics", help="List all available topics in one Telegram forum")
+    topics.add_argument("--chat", required=True, help="Accessible forum ID, username, or exact title")
+    topics.add_argument("--format", choices=("json", "csv"), default="json")
+    topics.add_argument("--output-dir", help="Private export root (default: Telegram skill data directory)")
+    topics.add_argument("--max-topics", type=int, default=folders_forums_module.DEFAULT_MAX_TOPICS)
     participants = sub.add_parser("participants", help="Export accessible participants from one group or channel")
     participants.add_argument("--chat", required=True, help="Accessible group/channel ID, username, or exact title")
     participants.add_argument(
@@ -1579,6 +1752,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--days", type=int, default=None, help=f"Initial export lookback (default {DEFAULT_DAYS})")
             command.add_argument("--since", help="Inclusive start date YYYY-MM-DD (UTC)")
             command.add_argument("--until", help="Inclusive end date YYYY-MM-DD (UTC)")
+            command.add_argument("--topic-id", type=int, help="Export all accessible messages in this forum topic (1 is General)")
+            command.add_argument("--all-history", action="store_true", help="Export all Telegram-visible history in resumable bounded pages")
         if name in {"export", "sync"}:
             command.add_argument("--max-messages", type=int, default=DEFAULT_LIMIT)
     media = sub.add_parser("media", help="Download media from one explicitly selected chat")
@@ -1600,6 +1775,8 @@ def build_parser() -> argparse.ArgumentParser:
     media_export.add_argument("--max-messages", type=int, default=DEFAULT_MAX_MESSAGES)
     media_export.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
     media_export.add_argument("--max-total-bytes", type=int, default=DEFAULT_MAX_TOTAL_BYTES)
+    media_export.add_argument("--topic-id", type=int, help="Restrict the bounded media export to one forum topic (1 is General)")
+    media_export.add_argument("--offset-id", type=int, help="Continue a partial media scan before the returned next_offset_id")
     send = sub.add_parser("send", help="Send one message (dry run unless --confirm)")
     send.add_argument("--chat", required=True, help="Chat ID, @username or exact dialog title")
     send.add_argument("--text", required=True, help="Exact message text")
@@ -1647,6 +1824,32 @@ async def dispatch(args: argparse.Namespace) -> int:
             output_format=args.format,
             output_dir=args.output_dir,
             max_dialogs=args.max_dialogs,
+        )
+    if args.command == "folders":
+        if args.folders_command == "list":
+            return await folders_forums_module.command_folders_list(
+                sys.modules[__name__],
+                output_format=args.format,
+                output_dir=args.output_dir,
+            )
+        if not 1 <= args.max_chats <= MAX_DIALOGS_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-chats must be between 1 and {MAX_DIALOGS_LIMIT}."}}, 2)
+        return await folders_forums_module.command_folder_chats(
+            sys.modules[__name__],
+            args.folder,
+            output_format=args.format,
+            output_dir=args.output_dir,
+            max_chats=args.max_chats,
+        )
+    if args.command == "topics":
+        if not 1 <= args.max_topics <= folders_forums_module.MAX_TOPICS_LIMIT:
+            return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-topics must be between 1 and {folders_forums_module.MAX_TOPICS_LIMIT}."}}, 2)
+        return await folders_forums_module.command_topics(
+            sys.modules[__name__],
+            args.chat,
+            output_format=args.format,
+            output_dir=args.output_dir,
+            max_topics=args.max_topics,
         )
     if args.command == "participants":
         if not 1 <= args.max_participants <= MAX_PARTICIPANTS_LIMIT:
@@ -1697,6 +1900,8 @@ async def dispatch(args: argparse.Namespace) -> int:
             max_file_bytes=args.max_file_bytes,
             max_total_bytes=args.max_total_bytes,
             allowed_types=allowed_types,
+            topic_id=args.topic_id,
+            offset_id=args.offset_id,
         )
     if args.command == "send":
         return await send_batch([{"chat": args.chat, "text": args.text}], confirm=args.confirm)
@@ -1728,6 +1933,24 @@ async def dispatch(args: argparse.Namespace) -> int:
     if args.command in {"export", "sync"}:
         if args.max_messages < 1 or args.max_messages > MAX_LIMIT:
             return emit({"status": "error", "error": {"code": "invalid_limit", "message": f"--max-messages must be between 1 and {MAX_LIMIT}."}}, 2)
+        if args.command == "export" and args.topic_id is not None:
+            if args.topic_id < 1:
+                return emit({"status": "error", "error": {"code": "invalid_topic_id", "message": "--topic-id must be a positive integer."}}, 2)
+            if args.days is not None or args.since is not None or args.until is not None:
+                return emit({"status": "error", "error": {"code": "conflicting_scope", "message": "Forum topic exports cover accessible topic history and cannot be combined with --days, --since, or --until."}}, 2)
+            return await folders_forums_module.command_export_topic(
+                sys.modules[__name__],
+                args.chat,
+                topic_id=args.topic_id,
+                max_messages=args.max_messages,
+                output_dir=None,
+            )
+        if args.command == "export" and args.all_history:
+            if args.days is not None or args.since is not None or args.until is not None:
+                return emit({"status": "error", "error": {"code": "conflicting_scope", "message": "--all-history cannot be combined with --days, --since, or --until."}}, 2)
+            return await command_all_history_export(args.chat, limit=args.max_messages)
+        if args.command == "sync" and (getattr(args, "topic_id", None) is not None or getattr(args, "all_history", False)):
+            return emit({"status": "error", "error": {"code": "unsupported_scope", "message": "Use `telegram export` for topic or all-history exports; sync remains chat-wide incremental sync."}}, 2)
         if args.command == "export" and args.days is not None and args.days < 1:
             return emit({"status": "error", "error": {"code": "invalid_days", "message": "--days must be at least 1."}}, 2)
         if args.command == "export" and args.since and args.days is not None:

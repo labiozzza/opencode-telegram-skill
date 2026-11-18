@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- Inventory Telegram folders using effective membership and export paginated forum topics, including General.
+- Add resumable API-visible chat and forum-topic history exports plus topic-scoped media downloads.
+- Match exported participants to existing private dialogs only by numeric `user_id`; document the inventory-and-approval workflow.
+
 ## 0.4.0
 
 - Add explicitly scoped `telegram media download` and date-bounded `telegram media export`.
