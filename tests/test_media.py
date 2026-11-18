@@ -163,7 +163,7 @@ class MediaStorageTests(unittest.TestCase):
                 manifest = [json.loads(line) for line in store.manifest_path.read_text(encoding="utf-8").splitlines()]
                 self.assertEqual(len(manifest), 1)
                 self.assertEqual(manifest[0]["source_id"], "-100123:101:0")
-                self.assertEqual(manifest[0]["relative_path"], path.relative_to(root).as_posix())
+                self.assertEqual(manifest[0]["relative_path"], path.relative_to(store.root).as_posix())
 
         asyncio.run(run())
 
@@ -342,7 +342,7 @@ class MediaStorageTests(unittest.TestCase):
                     for line in store.manifest_path.read_text(encoding="utf-8").splitlines()
                 ]
                 self.assertEqual(len(manifest), 1)
-                self.assertEqual(manifest[0]["relative_path"], orphan.relative_to(root).as_posix())
+                self.assertEqual(manifest[0]["relative_path"], orphan.relative_to(store.root).as_posix())
 
         asyncio.run(run())
 

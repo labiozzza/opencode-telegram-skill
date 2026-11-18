@@ -489,6 +489,7 @@ async def _scan_participants(
     output_format: str,
     root: Path,
 ) -> dict[str, Any]:
+    root = root.resolve(strict=True)
     participants_dir = _ensure_child_dir(tg, root, "participants")
     jsonl_path = participants_dir / f"chat_{chat['id']}.jsonl"
     state_path = participants_dir / f"chat_{chat['id']}.state.json"

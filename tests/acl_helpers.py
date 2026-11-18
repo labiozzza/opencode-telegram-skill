@@ -41,7 +41,13 @@ def assert_owner_only_acl(test: Any, path: Path, *, directory: bool = False) -> 
     test.assertEqual(ace[0], "A", acl_lines[0])
     test.assertEqual(ace[2], "FA", acl_lines[0])
     test.assertEqual(ace[3:5], ["", ""], acl_lines[0])
-    test.assertEqual(ace[5], _current_user_sid(), acl_lines[0])
+    current_sid = _current_user_sid()
+    # icacls serializes the local Administrator SID (RID 500) as the SDDL
+    # well-known alias LA instead of its machine-specific SID string.
+    trustee_matches = ace[5] == current_sid or (
+        ace[5] == "LA" and current_sid.rsplit("-", 1)[-1] == "500"
+    )
+    test.assertTrue(trustee_matches, acl_lines[0])
 
     if directory:
         inheritance_flags = re.findall(r"OI|CI", ace[1])
