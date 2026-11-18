@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from acl_helpers import assert_owner_only_acl
 from scripts import telegram
 from scripts import updater
 
@@ -793,21 +795,6 @@ class TelegramSkillTests(unittest.TestCase):
 
 def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
-
-
-def assert_owner_only_acl(test: unittest.TestCase, path: Path, *, directory: bool = False) -> None:
-    result = subprocess.run(
-        ["icacls", str(path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    acl_line = result.stdout.splitlines()[0]
-    test.assertEqual(acl_line.count(":("), 1, acl_line)
-    if directory:
-        test.assertIn(":(OI)(CI)(F)", acl_line)
-    else:
-        test.assertIn(":(F)", acl_line)
 
 
 if __name__ == "__main__":
